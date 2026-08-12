@@ -9,6 +9,7 @@ datasets/
 train/
 NoisyLR/
 evaluation/
+evaluation_clip/
 *.zip
 
 # Model Checkpoints & Weights
