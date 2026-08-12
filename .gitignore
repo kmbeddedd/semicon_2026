@@ -6,6 +6,10 @@ env/
 # Datasets directory (extracted files)
 data/
 datasets/
+train/
+NoisyLR/
+evaluation/
+*.zip
 
 # Model Checkpoints & Weights
 weights/*.pt
