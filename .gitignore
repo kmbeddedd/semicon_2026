@@ -13,6 +13,7 @@ evaluation/
 
 # Model Checkpoints & Weights
 weights/*.pt
+!weights/best_model.pt
 weights/*.onnx
 weights/*.bin
 
