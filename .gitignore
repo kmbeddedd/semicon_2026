@@ -1,0 +1,25 @@
+# Virtual Environment
+venv/
+env/
+.venv/
+
+# Datasets directory (extracted files)
+data/
+datasets/
+
+# Model Checkpoints & Weights
+weights/*.pt
+weights/*.onnx
+weights/*.bin
+
+# Python Bytecode & Cache
+__pycache__/
+*.pyc
+*.pyo
+
+# System & IDE files
+.DS_Store
+__MACOSX/
+.idea/
+.vscode/
+*.pptx
