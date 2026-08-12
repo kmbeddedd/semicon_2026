@@ -1,6 +1,6 @@
 # Semiconductor Image Restoration — NAFNet-SR
 
-AI-based restoration of degraded semiconductor inspection images using a lightweight NAFNet-based super-resolution and denoising model.
+AI-based  restoration of degraded semiconductor inspection images using a lightweight NAFNet-based super-resolution and denoising model.
 
 This repository contains the implementation, experiments, training configuration, validation setup, and results obtained while training the model on the provided semiconductor inspection dataset.
 
