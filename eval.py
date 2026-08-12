@@ -24,7 +24,7 @@ def main():
     print(f"[Metrology Eval] Using device: {device}")
 
     # Load Model
-    model = NAFNetSR(in_channels=1, out_channels=1, width=32, scale_factor=args.scale)
+    model = NAFNetSR(in_channels=1, out_channels=1, width=64, scale_factor=args.scale)
 
     if os.path.exists(args.weights):
         print(f"[Metrology Eval] Loading weights from: {args.weights}")

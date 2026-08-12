@@ -50,25 +50,45 @@ class FFTLoss(nn.Module):
 
         return F.l1_loss(pred_mag, target_mag)
 
+class SSIMLoss(nn.Module):
+    """1 - SSIM as a differentiable loss."""
+    def __init__(self, window_size=11):
+        super().__init__()
+        self.window_size = window_size
+
+    def forward(self, pred, target):
+        C1, C2 = 0.01**2, 0.03**2
+        pad = self.window_size // 2
+        mu_p = F.avg_pool2d(pred, self.window_size, stride=1, padding=pad)
+        mu_t = F.avg_pool2d(target, self.window_size, stride=1, padding=pad)
+        sigma_pp = F.avg_pool2d(pred * pred, self.window_size, stride=1, padding=pad) - mu_p * mu_p
+        sigma_tt = F.avg_pool2d(target * target, self.window_size, stride=1, padding=pad) - mu_t * mu_t
+        sigma_pt = F.avg_pool2d(pred * target, self.window_size, stride=1, padding=pad) - mu_p * mu_t
+        ssim = ((2 * mu_p * mu_t + C1) * (2 * sigma_pt + C2)) / ((mu_p**2 + mu_t**2 + C1) * (sigma_pp + sigma_tt + C2))
+        return 1 - ssim.mean()
+
 class MetrologyLoss(nn.Module):
     """
     Composite Metrology Loss tailored for Semiconductor Inspection Image Restoration.
-    Combines Charbonnier (robust pixel), Sobel (edge/boundary), and 2D FFT (speckle frequency).
+    Combines Charbonnier (robust pixel), Sobel (edge/boundary), 2D FFT (speckle frequency), and SSIM (structural).
     """
-    def __init__(self, w_charb=1.0, w_edge=0.5, w_fft=0.1):
+    def __init__(self, w_charb=1.0, w_edge=0.3, w_fft=0.3, w_ssim=0.2):
         super().__init__()
         self.charbonnier = CharbonnierLoss()
         self.edge = SobelEdgeLoss()
         self.fft = FFTLoss()
+        self.ssim = SSIMLoss()
 
         self.w_charb = w_charb
         self.w_edge = w_edge
         self.w_fft = w_fft
+        self.w_ssim = w_ssim
 
     def forward(self, pred, target):
         l_charb = self.charbonnier(pred, target)
         l_edge = self.edge(pred, target)
         l_fft = self.fft(pred, target)
-        
-        total = self.w_charb * l_charb + self.w_edge * l_edge + self.w_fft * l_fft
-        return total, {"charb": l_charb.item(), "edge": l_edge.item(), "fft": l_fft.item()}
+        l_ssim = self.ssim(pred, target)
+
+        total = self.w_charb * l_charb + self.w_edge * l_edge + self.w_fft * l_fft + self.w_ssim * l_ssim
+        return total, {"charb": l_charb.item(), "edge": l_edge.item(), "fft": l_fft.item(), "ssim": l_ssim.item()}

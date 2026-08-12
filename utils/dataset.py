@@ -23,11 +23,13 @@ class PairedSemiconDataset(Dataset):
     Expects input_dir and target_dir containing matching filenames (.npy, .png, .jpg, .tif).
     Optionally applies dynamic augmentations for training.
     """
-    def __init__(self, input_dir: str, target_dir: str = None, is_train: bool = False):
+    def __init__(self, input_dir: str, target_dir: str = None, is_train: bool = False, patch_size: int = 0, scale_factor: int = 2):
         super().__init__()
         self.input_dir = input_dir
         self.target_dir = target_dir
         self.is_train = is_train
+        self.patch_size = patch_size  # 0 = full image, >0 = random crop on input
+        self.scale_factor = scale_factor
 
         valid_exts = ('*.npy', '*.png', '*.jpg', '*.jpeg', '*.tif', '*.tiff', '*.bmp')
         self.input_paths = []
@@ -99,6 +101,16 @@ class PairedSemiconDataset(Dataset):
 
         if self.is_train and self.target_paths:
             inp_img, tgt_img = self._apply_augmentations(inp_img, tgt_img)
+
+        # Random patch crop during training
+        if self.is_train and self.patch_size > 0:
+            h, w = inp_img.shape
+            ps = min(self.patch_size, h, w)
+            rh = np.random.randint(0, h - ps + 1)
+            rw = np.random.randint(0, w - ps + 1)
+            inp_img = inp_img[rh:rh+ps, rw:rw+ps]
+            s = self.scale_factor
+            tgt_img = tgt_img[rh*s:(rh+ps)*s, rw*s:(rw+ps)*s]
 
         # Convert to Tensor [1, H, W]
         inp_tensor = torch.from_numpy(inp_img).unsqueeze(0).float()

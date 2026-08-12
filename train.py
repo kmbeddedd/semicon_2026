@@ -14,10 +14,11 @@ def parse_args():
     parser.add_argument("--val_input", type=str, default="data/val/NoisyLR", help="Directory with degraded validation images/npy files")
     parser.add_argument("--val_target", type=str, default="data/val/GT", help="Directory with target validation images/npy files")
     parser.add_argument("--save_dir", type=str, default="weights", help="Directory to save model checkpoints")
-    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--epochs", type=int, default=200, help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--scale", type=int, default=2, help="Scale factor (1 for same-res denoising, 2 for SR)")
+    parser.add_argument("--patch_size", type=int, default=64, help="Random crop patch size (0 for full image)")
     return parser.parse_args()
 
 def main():
@@ -31,17 +32,17 @@ def main():
         print(f"[Metrology Training] Dataset directory not found: '{args.train_input}'. Please populate your dataset before training.")
         return
 
-    train_ds = PairedSemiconDataset(args.train_input, args.train_target, is_train=True)
+    train_ds = PairedSemiconDataset(args.train_input, args.train_target, is_train=True, patch_size=args.patch_size, scale_factor=args.scale)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
 
-    val_ds = PairedSemiconDataset(args.val_input, args.val_target, is_train=False) if os.path.exists(args.val_input) else None
+    val_ds = PairedSemiconDataset(args.val_input, args.val_target, is_train=False, scale_factor=args.scale) if os.path.exists(args.val_input) else None
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False) if val_ds else None
 
     # Model, Optimizer, Loss
-    model = NAFNetSR(in_channels=1, out_channels=1, width=32, scale_factor=args.scale).to(device)
+    model = NAFNetSR(in_channels=1, out_channels=1, width=64, scale_factor=args.scale).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
-    criterion = MetrologyLoss(w_charb=1.0, w_edge=0.5, w_fft=0.1).to(device)
+    criterion = MetrologyLoss(w_charb=1.0, w_edge=0.3, w_fft=0.3, w_ssim=0.2).to(device)
 
     best_psnr = 0.0
 
