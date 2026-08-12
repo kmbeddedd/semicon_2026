@@ -85,7 +85,7 @@ class PairedSemiconDataset(Dataset):
         inp_raw = self._load_image(inp_path)
 
         # Apply robust dynamic range percentile normalization
-        inp_img = robust_percentile_normalize(inp_raw)
+        inp_img = np.clip(inp_raw,0.0,1.0).astype(np.float32)
 
         if self.target_paths:
             tgt_path = self.target_paths[idx]
