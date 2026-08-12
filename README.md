@@ -321,6 +321,7 @@ The first baseline used per-image percentile normalization:
 ```text
 P0.01 → P99.99 → [0,1]
 ```
+
 Analysis across the 320-image validation set showed a systematic intensity mismatch:
 
 ```text
@@ -336,10 +337,11 @@ A controlled experiment replaced percentile normalization with simple clipping:
 ```text
 NoisyLR → clip to [0,1]
 ```
-```
+
 The model architecture, loss, optimizer, batch size, dataset split, and training schedule were kept unchanged.
 
 ### Normalization Experiment
+
 | Configuration | Best PSNR | Best SSIM | Best Epoch |
 |---|---:|---:|---:|
 | Percentile normalization | 25.43 dB | ~0.75 | 36 |
@@ -350,7 +352,7 @@ The clipping approach improved validation PSNR by approximately **2.50 dB**.
 This indicates that preserving the original NoisyLR intensity relationship with the ground truth is beneficial for this dataset.
 
 The clipping experiment is now the current training baseline for further optimization.
-```
+
 
 ## 16. Repository Structure
 
