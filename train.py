@@ -19,6 +19,8 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--scale", type=int, default=2, help="Scale factor (1 for same-res denoising, 2 for SR)")
     parser.add_argument("--patch_size", type=int, default=64, help="Random crop patch size (0 for full image)")
+    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader workers")
+    parser.add_argument("--no_amp", action="store_true", help="Disable Automatic Mixed Precision (AMP)")
     return parser.parse_args()
 
 def main():
@@ -27,16 +29,24 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Metrology Training] Training on device: {device}")
 
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        print("[Metrology Training] Enabled cuDNN Benchmark & Tensor Core optimization.")
+
+    use_amp = (device.type == "cuda") and (not args.no_amp)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    print(f"[Metrology Training] Automatic Mixed Precision (AMP FP16): {use_amp}")
+
     # Dataset & DataLoader
     if not os.path.exists(args.train_input) or not os.path.exists(args.train_target):
         print(f"[Metrology Training] Dataset directory not found: '{args.train_input}'. Please populate your dataset before training.")
         return
 
     train_ds = PairedSemiconDataset(args.train_input, args.train_target, is_train=True, patch_size=args.patch_size, scale_factor=args.scale)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, persistent_workers=(args.num_workers > 0))
 
     val_ds = PairedSemiconDataset(args.val_input, args.val_target, is_train=False, scale_factor=args.scale) if os.path.exists(args.val_input) else None
-    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False) if val_ds else None
+    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=args.num_workers, pin_memory=True) if val_ds else None
 
     # Model, Optimizer, Loss
     model = NAFNetSR(in_channels=1, out_channels=1, width=64, scale_factor=args.scale).to(device)
@@ -51,13 +61,17 @@ def main():
         running_loss = 0.0
 
         for inp, tgt, _ in train_loader:
-            inp, tgt = inp.to(device), tgt.to(device)
+            inp = inp.to(device, non_blocking=True)
+            tgt = tgt.to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            pred = model(inp)
-            loss, _ = criterion(pred, tgt)
-            loss.backward()
-            optimizer.step()
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                pred = model(inp)
+                loss, _ = criterion(pred, tgt)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             running_loss += loss.item()
 
@@ -71,8 +85,10 @@ def main():
             val_psnrs, val_ssims = [], []
             with torch.no_grad():
                 for inp, tgt, _ in val_loader:
-                    inp, tgt = inp.to(device), tgt.to(device)
-                    pred = model(inp)
+                    inp = inp.to(device, non_blocking=True)
+                    tgt = tgt.to(device, non_blocking=True)
+                    with torch.cuda.amp.autocast(enabled=use_amp):
+                        pred = model(inp)
                     p, s = evaluate_metrics(pred, tgt)
                     val_psnrs.append(p)
                     val_ssims.append(s)
