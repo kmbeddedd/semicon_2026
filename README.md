@@ -316,23 +316,12 @@ Therefore, further investigation is required.
 
 ## 15. Current Investigation
 
-One potential limitation identified in the current implementation is input normalization.
-
-The current dataset loader applies per-image percentile normalization:
+The first baseline used per-image percentile normalization:
 
 ```text
-P0.01 → P99.99
+P0.01 → P99.99 → [0,1]
 ```
-
-to NoisyLR images.
-
-Ground-truth images are only clipped to:
-
-```text
-[0, 1]
-```
-
-Across the 320-image validation set:
+Analysis across the 320-image validation set showed a systematic intensity mismatch:
 
 ```text
 Normalized NoisyLR mean : 0.313
@@ -342,9 +331,26 @@ Normalized NoisyLR std  : 0.155
 GT std                  : 0.187
 ```
 
-This indicates a systematic intensity and contrast mismatch between normalized inputs and targets.
+A controlled experiment replaced percentile normalization with simple clipping:
 
-The next experiment is to investigate whether a less aggressive preprocessing strategy improves reconstruction quality.
+```text
+NoisyLR → clip to [0,1]
+```
+```
+The model architecture, loss, optimizer, batch size, dataset split, and training schedule were kept unchanged.
+
+### Normalization Experiment
+| Configuration | Best PSNR | Best SSIM | Best Epoch |
+|---|---:|---:|---:|
+| Percentile normalization | 25.43 dB | ~0.75 | 36 |
+| Simple clipping | **27.93 dB** | **0.7700** | 47 |
+
+The clipping approach improved validation PSNR by approximately **2.50 dB**.
+
+This indicates that preserving the original NoisyLR intensity relationship with the ground truth is beneficial for this dataset.
+
+The clipping experiment is now the current training baseline for further optimization.
+```
 
 ## 16. Repository Structure
 
