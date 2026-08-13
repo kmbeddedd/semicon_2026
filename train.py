@@ -38,7 +38,7 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False) if val_ds else None
 
     # Model, Optimizer, Loss
-    model = NAFNetSR(in_channels=1, out_channels=1, width=32, scale_factor=args.scale).to(device)
+    model = NAFNetSR(in_channels=1, out_channels=1, width=48, scale_factor=args.scale).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
     criterion = MetrologyLoss(w_charb=1.0, w_edge=0.5, w_fft=0.1).to(device)
