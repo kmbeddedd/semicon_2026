@@ -316,13 +316,13 @@ Therefore, further investigation is required.
 
 ## 15. Current Investigation
 
-The first baseline used per-image percentile normalization:
+The initial baseline used per-image percentile normalization:
 
 ```text
 P0.01 → P99.99 → [0,1]
 ```
 
-Analysis across the 320-image validation set showed a systematic intensity mismatch:
+Analysis across the 320-image validation set showed a systematic intensity and contrast mismatch between the normalized NoisyLR inputs and the ground-truth images:
 
 ```text
 Normalized NoisyLR mean : 0.313
@@ -340,19 +340,271 @@ NoisyLR → clip to [0,1]
 
 The model architecture, loss, optimizer, batch size, dataset split, and training schedule were kept unchanged.
 
-### Normalization Experiment
+### 15.1 Normalization Experiment
 
 | Configuration | Best PSNR | Best SSIM | Best Epoch |
 |---|---:|---:|---:|
 | Percentile normalization | 25.43 dB | ~0.75 | 36 |
-| Simple clipping | **27.93 dB** | **0.7700** | 47 |
+| Simple clipping | **27.93 dB** | **0.7695** | 47 |
 
 The clipping approach improved validation PSNR by approximately **2.50 dB**.
 
-This indicates that preserving the original NoisyLR intensity relationship with the ground truth is beneficial for this dataset.
+Therefore, simple clipping is the current preprocessing baseline.
 
-The clipping experiment is now the current training baseline for further optimization.
+### 15.2 Loss Investigation
 
+The composite Metrology Loss combines:
+
+```text
+Charbonnier Loss
+Sobel Edge Loss
+FFT Loss
+```
+
+The baseline configuration is:
+
+```text
+Charbonnier weight : 1.0
+Edge weight        : 0.5
+FFT weight         : 0.1
+```
+
+An experiment using normalized FFT loss produced:
+
+```text
+Best PSNR : 27.81 dB
+Best SSIM : 0.7701
+```
+
+compared with the raw FFT baseline:
+
+```text
+Best PSNR : 27.93 dB
+Best SSIM : 0.7695
+```
+
+The normalized FFT formulation therefore did not improve the primary PSNR metric and was not adopted.
+
+### 15.3 Model Capacity Investigation
+
+The baseline NAFNet-SR model uses:
+
+```text
+Width      : 32
+Parameters : 2.416M
+```
+
+A wider model with:
+
+```text
+Width      : 48
+Parameters : 5.394M
+Peak VRAM  : ~3.63 GB
+```
+
+was tested for 5 epochs.
+
+Results:
+
+| Configuration | Best PSNR | Best SSIM |
+|---|---:|---:|
+| Width 32 | 27.17 dB | 0.7388 |
+| Width 48 | 27.44 dB | 0.7485 |
+
+The wider model showed only a modest improvement of approximately **0.27 dB** in the short 5-epoch experiment while more than doubling the parameter count.
+
+Since the comparison was not run to full convergence, width 48 was not adopted as the new baseline.
+
+### 15.4 Difficulty-Aware Sampling Investigation
+
+Validation analysis showed that reconstruction difficulty varies substantially across samples.
+
+Training-set difficulty was measured using the MSE between the clipped NoisyLR input and a downsampled ground-truth image:
+
+```text
+Training samples : 2880
+
+Mean difficulty : 0.007026
+Median          : 0.006487
+P90             : 0.012181
+P95             : 0.013841
+Maximum         : 0.039646
+```
+
+A difficulty threshold of:
+
+```text
+difficulty >= 0.01
+```
+
+identified:
+
+```text
+639 / 2880 samples = 22.19%
+```
+
+A controlled experiment assigned these samples a 2× sampling weight, increasing their effective sampling frequency to approximately:
+
+```text
+22.19% → 36.37%
+```
+
+The 5-epoch results were:
+
+| Configuration | Best PSNR | Best SSIM |
+|---|---:|---:|
+| Normal sampling | 27.17 dB | 0.7388 |
+| 2× hard-sample weighting | 27.11 dB | 0.7382 |
+
+No improvement was observed, so hard-sample oversampling was not adopted.
+
+### 15.5 Learning-Rate Schedule Investigation
+
+The baseline uses cosine annealing:
+
+```text
+T_max  = number of training epochs
+eta_min = 1e-6
+```
+
+For a 50-epoch run, the learning rate falls to approximately:
+
+```text
+Epoch 36 : 2.07e-4
+Epoch 40 : 1.16e-4
+Epoch 47 : 1.67e-5
+Epoch 50 : 1.99e-6
+```
+
+A controlled experiment used:
+
+```text
+T_max = 2 × number of training epochs
+```
+
+to maintain a larger learning rate during the later stages of training.
+
+The 5-epoch results were:
+
+| Configuration | Best PSNR | Best SSIM |
+|---|---:|---:|
+| Original cosine schedule | 27.17 dB | 0.7388 |
+| Slower cosine decay | 27.01 dB | 0.7318 |
+
+The slower schedule did not show an improvement and was therefore not adopted.
+
+### 15.6 Residual Super-Resolution Investigation
+
+The current NAFNet-SR model originally used a residual connection only when the output and input resolutions were identical.
+
+For the 2× super-resolution task:
+
+```text
+Input  : 128 × 128
+Output : 256 × 256
+```
+
+the original residual connection was therefore inactive.
+
+A controlled architectural experiment introduced an explicit bilinear upsampling skip:
+
+```text
+Bilinear(LR) + NAFNet residual correction → HR output
+```
+
+The motivation was to allow the network to learn a correction over a simple interpolation baseline rather than reconstructing the complete HR image independently.
+
+The full validation bilinear baseline was:
+
+```text
+Bilinear PSNR : 24.6606 dB
+Bilinear SSIM : 0.6114
+```
+
+The bilinear-to-ground-truth residual had:
+
+```text
+Mean residual MAE   : 0.044487
+Median residual MAE : 0.043510
+P90 residual MAE    : 0.062568
+Maximum residual MAE : 0.111293
+```
+
+The residual architecture was then tested for 5 epochs:
+
+| Configuration | Best PSNR | Best SSIM |
+|---|---:|---:|
+| Original NAFNet-SR | 27.17 dB | 0.7388 |
+| Bilinear residual skip | 27.21 dB | 0.7392 |
+
+The improvement was only:
+
+```text
+PSNR : +0.04 dB
+SSIM : +0.0004
+```
+
+Evaluation of representative difficult samples also showed no consistent improvement. In particular, the baseline model's strong result on `000316.npy` was reduced from approximately:
+
+```text
+34.08 dB → 32.22 dB
+```
+
+with the residual formulation.
+
+Therefore, the bilinear residual architecture was not adopted.
+
+### 15.7 Current Best Configuration
+
+After the controlled experiments above, the current baseline remains:
+
+```text
+Model          : NAFNet-SR
+Width          : 32
+Parameters     : 2.416M
+
+Input          : 128 × 128 single-channel NoisyLR
+Output         : 256 × 256 single-channel restored image
+
+Preprocessing  : clip to [0,1]
+
+Loss:
+  Charbonnier  : 1.0
+  Sobel Edge   : 0.5
+  Raw FFT      : 0.1
+
+Optimizer      : AdamW
+Weight decay   : 1e-4
+Scheduler      : CosineAnnealingLR
+
+Batch size     : 8
+Best epoch     : 47
+
+Validation:
+  PSNR         : 27.93 dB
+  SSIM         : 0.7695
+```
+
+The current model substantially outperforms simple interpolation baselines:
+
+```text
+Bilinear PSNR : 24.66 dB
+NAFNet PSNR   : 27.93 dB
+
+Bilinear SSIM : 0.6114
+NAFNet SSIM   : 0.7695
+```
+
+The remaining gap to the project's target of approximately:
+
+```text
+PSNR > 32 dB
+SSIM > 0.92
+```
+
+indicates that further investigation is still required.
+
+The current evidence suggests that the remaining difficulty is strongly related to the varying degradation regimes present in the dataset rather than being solved by simple changes to normalization, sampling, learning-rate decay, model width, or a direct bilinear residual skip.
 
 ## 16. Repository Structure
 
