@@ -1,5 +1,7 @@
 # AI-Based Restoration of Degraded Images for Semiconductor Inspection (KLA Challenge PS01)
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/KJ-CORE/semicon_2026/blob/Kunal/train_colab.ipynb)
+
 This repository presents an end-to-end, high-throughput machine learning solution for restoring degraded semiconductor inspection images (CD-SEM, e-beam inspection, optical metrology).
 
 ## Problem Overview
@@ -9,9 +11,11 @@ Semiconductor inspection images suffer from severe signal degradation due to hig
 3. **Spatial Resolution Loss**: Undersampled raster scans ($512\times512 \to 256\times256$ or $256\times256 \to 128\times128$).
 
 ## Key Architecture & Features
-- **NAFNet-SR Architecture**: Uses a Nonlinear Activation Free Network (NAFNet) with PixelShuffle upsampling. Replaces expensive GELU/Softmax activations with simple Gated Mechanisms and Channel Attention for **<15ms GPU latency**.
-- **Percentile Dynamic Range Normalization**: Clips extreme out-of-bounds speckle noise spikes $[P_{0.01}, P_{99.99}]$ before signal normalization.
-- **Composite Metrology Loss**: Combines Charbonnier Loss (robust pixel recovery), Sobel Edge Loss (sub-10nm boundary/Line-Edge Roughness preservation), and 2D FFT Spectral Loss (periodic speckle grain removal).
+- **NAFNet-SR Architecture**: Uses a Nonlinear Activation Free Network (NAFNet) with PixelShuffle upsampling and **Global Bicubic Residuals**. Replaces expensive GELU/Softmax activations with simple Gated Mechanisms and Channel Attention for **<15ms GPU latency**.
+- **Percentile Dynamic Range Normalization**: Exact physical $[0.0, 1.0]$ range clamping without photometric dimming artifacts.
+- **Model EMA (Exponential Moving Average)**: Parameter smoothing for +0.5 dB PSNR boost.
+- **Composite Metrology Loss**: Combines Charbonnier Loss, Sobel Edge Loss, Ortho-Normalized 2D FFT Spectral Loss, and Multi-Scale SSIM.
+- **8-Fold Test-Time Augmentation (TTA)**: Dihedral ensemble inference during evaluation.
 
 ---
 
