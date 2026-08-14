@@ -6,7 +6,6 @@ import cv2
 import numpy as np
 import torch
 from models.nafnet import NAFNetSR
-from utils.dataset import robust_percentile_normalize
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Standalone Evaluation Script for Semiconductor Inspection Image Restoration")
@@ -14,6 +13,7 @@ def parse_args():
     parser.add_argument("--output_dir", "-o", type=str, required=True, help="Path to output directory for restored images")
     parser.add_argument("--weights", "-w", type=str, default="weights/best_model.pt", help="Path to trained model weights (.pt or .onnx)")
     parser.add_argument("--scale", type=int, default=2, help="Upscaling scale factor (1 or 2)")
+    parser.add_argument("--width", type=int, default=48, help="NAFNet base width")
     return parser.parse_args()
 
 def main():
@@ -24,7 +24,7 @@ def main():
     print(f"[Metrology Eval] Using device: {device}")
 
     # Load Model
-    model = NAFNetSR(in_channels=1, out_channels=1, width=32, scale_factor=args.scale)
+    model = NAFNetSR(in_channels=1, out_channels=1, width=args.width, scale_factor=args.scale)
 
     if os.path.exists(args.weights):
         print(f"[Metrology Eval] Loading weights from: {args.weights}")
@@ -65,8 +65,8 @@ def main():
                     continue
                 raw_img = img_bgr.astype(np.float32) / 255.0
 
-            # Percentile normalization to handle speckle overflow
-            norm_img = robust_percentile_normalize(raw_img)
+            # Match training preprocessing: simple clipping
+            norm_img = np.clip(raw_img, 0.0, 1.0)
 
             # Tensor conversion [1, 1, H, W]
             inp_t = torch.from_numpy(norm_img).unsqueeze(0).unsqueeze(0).float().to(device)
