@@ -7,8 +7,9 @@ env/
 data/
 datasets/
 
-# Model Checkpoints & Weights
+# Model Checkpoints & Weights (ignore large checkpoints, but track best_model.pt < 100MB)
 weights/*.pt
+!weights/best_model.pt
 weights/*.onnx
 weights/*.bin
 
