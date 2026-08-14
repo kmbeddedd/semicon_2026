@@ -80,9 +80,9 @@ class NAFBlock(nn.Module):
 class NAFNetSR(nn.Module):
     """
     NAFNet for Semiconductor Inspection Image Restoration & Super-Resolution.
-    Handles joint Denoising (Speckle + Gaussian) and 2x Upscaling (or 1x Denoising).
+    Handles joint Denoising (Speckle + Gaussian) and 2x Upscaling with Global Bicubic Residual Skip.
     """
-    def __init__(self, in_channels=1, out_channels=1, width=32, enc_blocks=[2, 2, 2], dec_blocks=[2, 2, 2], scale_factor=2):
+    def __init__(self, in_channels=1, out_channels=1, width=64, enc_blocks=[2, 2, 2], dec_blocks=[2, 2, 2], scale_factor=2):
         super().__init__()
         self.scale_factor = scale_factor
         self.intro = nn.Conv2d(in_channels, width, kernel_size=3, padding=1)
@@ -136,8 +136,11 @@ class NAFNetSR(nn.Module):
 
         out = self.head(x)
 
-        # Residual connection if output resolution equals input resolution
-        if out.shape == inp.shape:
+        # Global residual connection: learn residual on top of bicubic upsampled base
+        if self.scale_factor > 1:
+            base = F.interpolate(inp, scale_factor=self.scale_factor, mode='bicubic', align_corners=False)
+            out = out + base
+        elif out.shape == inp.shape:
             out = out + inp
 
         return torch.clamp(out, 0.0, 1.0)
