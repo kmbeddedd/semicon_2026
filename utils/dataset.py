@@ -5,29 +5,26 @@ import cv2
 import torch
 from torch.utils.data import Dataset
 
-def robust_percentile_normalize(img: np.ndarray, p_low: float = 0.01, p_high: float = 99.99) -> np.ndarray:
+def robust_percentile_normalize(img: np.ndarray) -> np.ndarray:
     """
     Robust intensity normalization for semiconductor inspection images.
-    Clips extreme out-of-range speckle noise spikes before mapping signal to [0, 1].
+    Preserves exact physical [0, 1] dynamic range while clipping extreme shot noise outliers.
     """
-    low, high = np.percentile(img, (p_low, p_high))
-    if high - low < 1e-6:
-        return np.zeros_like(img, dtype=np.float32)
-    img_clipped = np.clip(img, low, high)
-    normalized = (img_clipped - low) / (high - low)
-    return normalized.astype(np.float32)
+    return np.clip(img, 0.0, 1.0).astype(np.float32)
 
 class PairedSemiconDataset(Dataset):
     """
     Paired dataset for semiconductor inspection image restoration.
     Expects input_dir and target_dir containing matching filenames (.npy, .png, .jpg, .tif).
-    Optionally applies dynamic augmentations for training.
+    Applies metrology-aware augmentations (Dihedral group, CutBlur, and noise jittering) during training.
     """
-    def __init__(self, input_dir: str, target_dir: str = None, is_train: bool = False):
+    def __init__(self, input_dir: str, target_dir: str = None, is_train: bool = False, patch_size: int = 0, scale_factor: int = 2):
         super().__init__()
         self.input_dir = input_dir
         self.target_dir = target_dir
         self.is_train = is_train
+        self.patch_size = patch_size  # 0 = full image (128x128), >0 = random crop
+        self.scale_factor = scale_factor
 
         valid_exts = ('*.npy', '*.png', '*.jpg', '*.jpeg', '*.tif', '*.tiff', '*.bmp')
         self.input_paths = []
@@ -58,7 +55,7 @@ class PairedSemiconDataset(Dataset):
             return img_raw.astype(np.float32) / 255.0
 
     def _apply_augmentations(self, inp: np.ndarray, tgt: np.ndarray):
-        # Random 90 degree rotations and flips
+        # 1. Random 90-degree rotations & Dihedral Flips
         rot_k = np.random.randint(0, 4)
         if rot_k > 0:
             inp = np.rot90(inp, rot_k)
@@ -72,10 +69,22 @@ class PairedSemiconDataset(Dataset):
             inp = np.flipud(inp)
             tgt = np.flipud(tgt)
 
-        # Synthetic speckle noise injection for robust OOD generalization
-        if np.random.rand() > 0.7:
-            speckle_noise = np.random.normal(1.0, 0.05, inp.shape)
-            inp = inp * speckle_noise
+        # 2. CutBlur Data Augmentation (teach network where and how much to sharpen)
+        if np.random.rand() < 0.2:
+            s = self.scale_factor
+            h, w = inp.shape
+            # Random box in input space
+            bh, bw = np.random.randint(h // 4, h // 2), np.random.randint(w // 4, w // 2)
+            ry, rx = np.random.randint(0, h - bh), np.random.randint(0, w - bw)
+            
+            # Downsampled clean target patch placed into input
+            tgt_down = cv2.resize(tgt[ry*s:(ry+bh)*s, rx*s:(rx+bw)*s], (bw, bh), interpolation=cv2.INTER_AREA)
+            inp[ry:ry+bh, rx:rx+bw] = tgt_down
+
+        # 3. Synthetic Poisson-Gaussian noise jittering for OOD generalization
+        if np.random.rand() < 0.3:
+            noise_std = np.random.uniform(0.01, 0.04)
+            inp = inp + np.random.normal(0.0, noise_std, inp.shape).astype(np.float32)
             inp = np.clip(inp, 0.0, 1.0)
 
         return inp.copy(), tgt.copy()
@@ -84,7 +93,7 @@ class PairedSemiconDataset(Dataset):
         inp_path = self.input_paths[idx]
         inp_raw = self._load_image(inp_path)
 
-        # Apply robust dynamic range percentile normalization
+        # Apply calibrated dynamic range clipping
         inp_img = robust_percentile_normalize(inp_raw)
 
         if self.target_paths:
@@ -99,6 +108,17 @@ class PairedSemiconDataset(Dataset):
 
         if self.is_train and self.target_paths:
             inp_img, tgt_img = self._apply_augmentations(inp_img, tgt_img)
+
+        # Optional random patch crop during training (if patch_size > 0 and < image size)
+        if self.is_train and self.patch_size > 0:
+            h, w = inp_img.shape
+            if self.patch_size < h and self.patch_size < w:
+                ps = self.patch_size
+                rh = np.random.randint(0, h - ps + 1)
+                rw = np.random.randint(0, w - ps + 1)
+                inp_img = inp_img[rh:rh+ps, rw:rw+ps]
+                s = self.scale_factor
+                tgt_img = tgt_img[rh*s:(rh+ps)*s, rw*s:(rw+ps)*s]
 
         # Convert to Tensor [1, H, W]
         inp_tensor = torch.from_numpy(inp_img).unsqueeze(0).float()
