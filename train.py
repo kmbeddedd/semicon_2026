@@ -188,7 +188,7 @@ def main():
                 "val_psnr": best_psnr,
                 "val_ssim": max(val_ssim, val_ssim_ema)
             }, "best_model.pt")
-            print(f"  \u2b50 Saved new best model checkpoint! Val PSNR: {best_psnr:.2f} dB")
+            print(f"  [+] Saved new best model checkpoint! Val PSNR: {best_psnr:.2f} dB")
 
     print(f"\n[Metrology Training] Training Complete! Best Validation PSNR: {best_psnr:.2f} dB")
 

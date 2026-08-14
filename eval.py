@@ -139,8 +139,8 @@ def main():
 
     if psnr_scores:
         print(f"[Metrology Eval] Benchmark Metrics across {len(psnr_scores)} Ground Truth pairs:")
-        print(f"  \u2705 Average PSNR: {np.mean(psnr_scores):.2f} dB")
-        print(f"  \u2705 Average SSIM: {np.mean(ssim_scores):.4f}")
+        print(f"  [+] Average PSNR: {np.mean(psnr_scores):.2f} dB")
+        print(f"  [+] Average SSIM: {np.mean(ssim_scores):.4f}")
 
 if __name__ == "__main__":
     main()
