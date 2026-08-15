@@ -89,8 +89,8 @@ def main():
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
-    # Loss Function (Calibrated Composite Metrology Loss)
-    criterion = MetrologyLoss(w_charb=1.0, w_edge=0.15, w_fft=0.05, w_ssim=0.2).to(device)
+    # Loss Function (Calibrated Composite Metrology Loss with empirical blur-free weighting)
+    criterion = MetrologyLoss(w_charb=1.0, w_edge=0.05, w_fft=0.05, w_ssim=0.2).to(device)
 
     best_psnr = 0.0
     print(f"[Metrology Training] Training {len(train_ds)} samples for {args.epochs} epochs (Batch Size: {args.batch_size})...")

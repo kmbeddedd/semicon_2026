@@ -77,14 +77,37 @@ class NAFBlock(nn.Module):
         x = self.conv5(x)
         return y + x * self.gamma
 
+class NoiseGate(nn.Module):
+    """
+    Learned Dynamic Noise Gate to prevent clean input damage.
+    Conditioned on estimated noise statistics (e.g. noise std sigma, patch variance, or (a, b) parameters),
+    outputs an adaptive gate weight in [0, 1] to softly blend between the base bicubic input and restored output.
+    """
+    def __init__(self, in_features=2, hidden_dim=16):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(in_features, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
+        # Default bias to 2.0 (gate ~ 0.88 towards denoising)
+        nn.init.constant_(self.mlp[2].bias, 2.0)
+
+    def forward(self, noisy_feat, base_feat, noise_stats):
+        gate = self.mlp(noise_stats).view(-1, 1, 1, 1)
+        return gate * noisy_feat + (1.0 - gate) * base_feat
+
 class NAFNetSR(nn.Module):
     """
     NAFNet for Semiconductor Inspection Image Restoration & Super-Resolution.
     Handles joint Denoising (Speckle + Gaussian) and 2x Upscaling with Global Bicubic Residual Skip.
+    Supports optional NoiseGate conditioning and zero-initialized residual head.
     """
-    def __init__(self, in_channels=1, out_channels=1, width=64, enc_blocks=[2, 2, 2], dec_blocks=[2, 2, 2], scale_factor=2):
+    def __init__(self, in_channels=1, out_channels=1, width=64, enc_blocks=[2, 2, 2], dec_blocks=[2, 2, 2], scale_factor=2, use_noise_gate=False):
         super().__init__()
         self.scale_factor = scale_factor
+        self.use_noise_gate = use_noise_gate
         self.intro = nn.Conv2d(in_channels, width, kernel_size=3, padding=1)
 
         self.encoders = nn.ModuleList()
@@ -115,10 +138,24 @@ class NAFNetSR(nn.Module):
                 nn.PixelShuffle(scale_factor),
                 nn.Conv2d(width, out_channels, kernel_size=3, padding=1)
             )
+            # Zero-initialize the final convolution so the initial state is exact bicubic identity
+            nn.init.zeros_(self.head[-1].weight)
+            if self.head[-1].bias is not None:
+                nn.init.zeros_(self.head[-1].bias)
         else:
             self.head = nn.Conv2d(width, out_channels, kernel_size=3, padding=1)
+            nn.init.zeros_(self.head.weight)
+            if self.head.bias is not None:
+                nn.init.zeros_(self.head.bias)
 
-    def forward(self, inp):
+        if use_noise_gate:
+            self.noise_gate = NoiseGate(in_features=2, hidden_dim=16)
+        else:
+            self.noise_gate = None
+
+    def forward(self, inp, noise_stats=None):
+        # Extract primary intensity channel for bicubic base if multi-channel input
+        raw_inp = inp[:, :1, :, :] if inp.shape[1] > 1 else inp
         x = self.intro(inp)
         skips = []
 
@@ -134,13 +171,23 @@ class NAFNetSR(nn.Module):
             x = x + skip
             x = decoder(x)
 
-        out = self.head(x)
+        res = self.head(x)
 
         # Global residual connection: learn residual on top of bicubic upsampled base
         if self.scale_factor > 1:
-            base = F.interpolate(inp, scale_factor=self.scale_factor, mode='bicubic', align_corners=False)
-            out = out + base
-        elif out.shape == inp.shape:
-            out = out + inp
+            base = F.interpolate(raw_inp, scale_factor=self.scale_factor, mode='bicubic', align_corners=False)
+            restored = base + res
+        elif res.shape == raw_inp.shape:
+            base = raw_inp
+            restored = base + res
+        else:
+            base = raw_inp
+            restored = res
+
+        # Optional learned dynamic noise gating
+        if self.noise_gate is not None and noise_stats is not None:
+            out = self.noise_gate(restored, base, noise_stats)
+        else:
+            out = restored
 
         return torch.clamp(out, 0.0, 1.0)
