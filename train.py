@@ -42,8 +42,89 @@ def parse_args():
     parser.add_argument("--resume", type=str, default="", help="Optional path to checkpoint (.pt) to resume training from")
     return parser.parse_args()
 
+def auto_detect_dataset_paths(args):
+    """
+    Automatically detects and resolves training and validation paths on Kaggle, Colab, or local disks.
+    If zip archives are found in /kaggle/input/ or current directory, extracts them automatically.
+    """
+    import zipfile, glob, shutil, random
+
+    if os.path.exists(args.train_input) and os.path.exists(args.train_target):
+        return args
+
+    print("[Dataset Auto-Detect] Checking /kaggle/input, /content, and local directories...")
+
+    # Check for zip files in /kaggle/input/ or root
+    search_dirs = ["/kaggle/input", "/kaggle/working", "/content", "data", "."]
+    for s_dir in search_dirs:
+        if os.path.exists(s_dir):
+            for z in glob.glob(os.path.join(s_dir, "**/*.zip"), recursive=True):
+                if any(k in z.lower() for k in ["train", "semicon", "dataset", "noisylr"]):
+                    print(f"[Dataset Auto-Detect] Found zip archive: '{z}'. Extracting to 'data/'...")
+                    os.makedirs("data", exist_ok=True)
+                    try:
+                        with zipfile.ZipFile(z, 'r') as zip_ref:
+                            zip_ref.extractall("data")
+                        print("[Dataset Auto-Detect] Extraction complete!")
+                        break
+                    except Exception as e:
+                        print(f"[Dataset Auto-Detect] Zip extraction note: {e}")
+
+    # Search for NoisyLR and GT directories anywhere
+    candidate_lr, candidate_gt = [], []
+    for s_dir in ["data", "/kaggle/input", "/content", "."]:
+        if os.path.exists(s_dir):
+            for root, dirs, _ in os.walk(s_dir):
+                for d in dirs:
+                    d_lower = d.lower()
+                    full_p = os.path.join(root, d)
+                    if "noisylr" in d_lower or "noisy_lr" in d_lower:
+                        candidate_lr.append(full_p)
+                    elif d == "GT" or d_lower == "gt" or "clean" in d_lower:
+                        candidate_gt.append(full_p)
+
+    for lr_p in candidate_lr:
+        parent = os.path.dirname(lr_p)
+        for gt_p in candidate_gt:
+            if os.path.dirname(gt_p) == parent or ("train" in lr_p.lower() and "train" in gt_p.lower()):
+                args.train_input = lr_p
+                args.train_target = gt_p
+                print(f"[Dataset Auto-Detect] Found Train Input: '{args.train_input}' | Target: '{args.train_target}'")
+                break
+        if os.path.exists(args.train_input) and os.path.exists(args.train_target):
+            break
+
+    # Auto-create 10% validation split if not present
+    if os.path.exists(args.train_input) and os.path.exists(args.train_target):
+        if not (os.path.exists(args.val_input) and os.path.exists(args.val_target)):
+            val_lr_dir = os.path.join("data", "val", "NoisyLR")
+            val_gt_dir = os.path.join("data", "val", "GT")
+            if not os.path.exists(val_lr_dir):
+                os.makedirs(val_lr_dir, exist_ok=True)
+                os.makedirs(val_gt_dir, exist_ok=True)
+                exts = ('*.npy', '*.png', '*.jpg', '*.tif')
+                files = []
+                for e in exts:
+                    files.extend(glob.glob(os.path.join(args.train_input, e)))
+                if files:
+                    random.seed(42)
+                    val_k = max(1, int(len(files) * 0.1))
+                    val_files = random.sample(files, k=val_k)
+                    for vf in val_files:
+                        fn = os.path.basename(vf)
+                        tgt_f = os.path.join(args.train_target, fn)
+                        shutil.copy(vf, os.path.join(val_lr_dir, fn))
+                        if os.path.exists(tgt_f):
+                            shutil.copy(tgt_f, os.path.join(val_gt_dir, fn))
+                    print(f"[Dataset Auto-Detect] Created 10% Val Split: {len(val_files)} samples in '{val_lr_dir}'")
+            args.val_input = val_lr_dir
+            args.val_target = val_gt_dir
+
+    return args
+
 def main():
     args = parse_args()
+    args = auto_detect_dataset_paths(args)
     os.makedirs(args.save_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Metrology Training] Training on device: {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
