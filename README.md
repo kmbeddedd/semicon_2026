@@ -87,7 +87,7 @@ Evaluated across **320 Ground-Truth validation image pairs** ($128\times128 \to 
 
 ### 1. Clone the Repository
 ```bash
-git clone -b Kunal https://github.com/KJ-CORE/semicon_2026.git
+git clone -b Kunal https://github.com/kmbedded/semicon_2026.git
 cd semicon_2026
 ```
 
