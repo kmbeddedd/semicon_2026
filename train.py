@@ -122,6 +122,17 @@ def auto_detect_dataset_paths(args):
 
     return args
 
+def fast_val_metrics_gpu(pred, tgt):
+    mse = torch.mean((pred - tgt) ** 2)
+    psnr = 10.0 * torch.log10(1.0 / (mse + 1e-8))
+    mu_x, mu_y = pred.mean(), tgt.mean()
+    var_x = ((pred - mu_x) ** 2).mean()
+    var_y = ((tgt - mu_y) ** 2).mean()
+    cov_xy = ((pred - mu_x) * (tgt - mu_y)).mean()
+    c1, c2 = (0.01) ** 2, (0.03) ** 2
+    ssim = ((2 * mu_x * mu_y + c1) * (2 * cov_xy + c2)) / ((mu_x**2 + mu_y**2 + c1) * (var_x + var_y + c2))
+    return psnr.item(), ssim.item()
+
 def main():
     args = parse_args()
     args = auto_detect_dataset_paths(args)
@@ -142,7 +153,7 @@ def main():
         print(f"[Metrology Training] ERROR: Dataset directory not found: '{args.train_input}'. Please verify paths.")
         return
 
-    train_ds = PairedSemiconDataset(args.train_input, args.train_target, is_train=True, patch_size=args.patch_size, scale_factor=args.scale)
+    train_ds = PairedSemiconDataset(args.train_input, args.train_target, is_train=True, patch_size=args.patch_size, scale_factor=args.scale, cache_in_memory=True)
     if len(train_ds) == 0:
         print(f"[Metrology Training] ERROR: No valid training image pairs found in '{args.train_input}' and '{args.train_target}'.")
         return
@@ -156,7 +167,7 @@ def main():
         persistent_workers=(args.num_workers > 0)
     )
 
-    val_ds = PairedSemiconDataset(args.val_input, args.val_target, is_train=False, scale_factor=args.scale) if (os.path.exists(args.val_input) and os.path.exists(args.val_target)) else None
+    val_ds = PairedSemiconDataset(args.val_input, args.val_target, is_train=False, scale_factor=args.scale, cache_in_memory=True) if (os.path.exists(args.val_input) and os.path.exists(args.val_target)) else None
     if val_ds and len(val_ds) == 0:
         val_ds = None
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=(device.type == "cuda")) if val_ds else None
@@ -195,8 +206,9 @@ def main():
     def lr_lambda(epoch):
         if epoch < args.warmup_epochs:
             return float(epoch + 1) / float(max(1, args.warmup_epochs))
-        progress = float(epoch - args.warmup_epochs) / float(max(1, args.epochs - args.warmup_epochs))
-        return 0.5 * (1.0 + torch.cos(torch.tensor(progress * 3.141592653589793)).item())
+        else:
+            progress = float(epoch - args.warmup_epochs) / float(max(1, args.epochs - args.warmup_epochs))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
@@ -238,7 +250,7 @@ def main():
         avg_loss = running_loss / num_batches
         avg_parts = {k: v / num_batches for k, v in running_parts.items()}
 
-        # Validation phase (evaluate on both Model and EMA model)
+        # Validation phase (evaluate on both Model and EMA model directly on GPU)
         val_psnr, val_ssim = 0.0, 0.0
         val_psnr_ema, val_ssim_ema = 0.0, 0.0
 
@@ -257,8 +269,8 @@ def main():
                         pred = model(inp)
                         pred_ema = ema.ema_model(inp)
 
-                    p, s = evaluate_metrics(pred, tgt)
-                    p_ema, s_ema = evaluate_metrics(pred_ema, tgt)
+                    p, s = fast_val_metrics_gpu(pred, tgt)
+                    p_ema, s_ema = fast_val_metrics_gpu(pred_ema, tgt)
                     val_psnrs.append(p)
                     val_ssims.append(s)
                     val_psnrs_ema.append(p_ema)

@@ -17,14 +17,16 @@ class PairedSemiconDataset(Dataset):
     Paired dataset for semiconductor inspection image restoration.
     Expects input_dir and target_dir containing matching filenames (.npy, .png, .jpg, .tif).
     Applies metrology-aware augmentations (Dihedral group, CutBlur, and noise jittering) during training.
+    Includes in-memory RAM caching for zero-latency multi-GPU streaming without disk I/O bottlenecks.
     """
-    def __init__(self, input_dir: str, target_dir: str = None, is_train: bool = False, patch_size: int = 0, scale_factor: int = 2):
+    def __init__(self, input_dir: str, target_dir: str = None, is_train: bool = False, patch_size: int = 0, scale_factor: int = 2, cache_in_memory: bool = True):
         super().__init__()
         self.input_dir = input_dir
         self.target_dir = target_dir
         self.is_train = is_train
         self.patch_size = patch_size  # 0 = full image (128x128), >0 = random crop
         self.scale_factor = scale_factor
+        self.cache_in_memory = cache_in_memory
 
         valid_exts = ('*.npy', '*.NPY', '*.png', '*.PNG', '*.jpg', '*.JPG', '*.jpeg', '*.JPEG', '*.tif', '*.TIF', '*.tiff', '*.TIFF', '*.bmp', '*.BMP')
         all_inputs = []
@@ -45,6 +47,17 @@ class PairedSemiconDataset(Dataset):
         else:
             self.input_paths = all_inputs
             self.target_paths = None
+
+        # Pre-cache images in RAM to saturate multi-GPU training
+        self.cached_inputs = []
+        self.cached_targets = []
+        if self.cache_in_memory and len(self.input_paths) > 0:
+            for i in range(len(self.input_paths)):
+                raw_inp = self._load_image(self.input_paths[i])
+                self.cached_inputs.append(robust_percentile_normalize(raw_inp))
+                if self.target_paths and i < len(self.target_paths):
+                    raw_tgt = self._load_image(self.target_paths[i])
+                    self.cached_targets.append(np.clip(raw_tgt, 0.0, 1.0).astype(np.float32))
 
     def __len__(self):
         return len(self.input_paths)
@@ -97,21 +110,22 @@ class PairedSemiconDataset(Dataset):
         return inp.copy(), tgt.copy()
 
     def __getitem__(self, idx: int):
-        inp_path = self.input_paths[idx]
-        inp_raw = self._load_image(inp_path)
-
-        # Apply calibrated dynamic range clipping
-        inp_img = robust_percentile_normalize(inp_raw)
-
-        if self.target_paths:
-            tgt_path = self.target_paths[idx]
-            if os.path.exists(tgt_path):
-                tgt_raw = self._load_image(tgt_path)
-                tgt_img = np.clip(tgt_raw, 0.0, 1.0).astype(np.float32)
+        if self.cache_in_memory and len(self.cached_inputs) > idx:
+            inp_img = self.cached_inputs[idx].copy()
+            tgt_img = self.cached_targets[idx].copy() if len(self.cached_targets) > idx else inp_img.copy()
+        else:
+            inp_path = self.input_paths[idx]
+            inp_raw = self._load_image(inp_path)
+            inp_img = robust_percentile_normalize(inp_raw)
+            if self.target_paths and idx < len(self.target_paths):
+                tgt_path = self.target_paths[idx]
+                if os.path.exists(tgt_path):
+                    tgt_raw = self._load_image(tgt_path)
+                    tgt_img = np.clip(tgt_raw, 0.0, 1.0).astype(np.float32)
+                else:
+                    tgt_img = inp_img.copy()
             else:
                 tgt_img = inp_img.copy()
-        else:
-            tgt_img = inp_img.copy()
 
         if self.is_train and self.target_paths:
             inp_img, tgt_img = self._apply_augmentations(inp_img, tgt_img)
