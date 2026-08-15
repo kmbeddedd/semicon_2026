@@ -1,6 +1,6 @@
 # AI-Based Restoration of Degraded Images for Semiconductor Inspection (KLA Challenge PS01)
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/KJ-CORE/semicon_2026/blob/Kunal/train_colab.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kmbeddedd/semicon_2026/blob/Kunal/train_colab.ipynb)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-orange.svg)](https://pytorch.org/)
 [![CUDA Accelerated](https://img.shields.io/badge/CUDA-Tensor%20Cores-green.svg)](https://developer.nvidia.com/cuda-zone)
@@ -168,7 +168,7 @@ $$\mathcal{L}_{\text{total}} = 1.0 \cdot \mathcal{L}_{\text{Charbonnier}} + 0.05
 
 ### 1. Clone the Repository
 ```bash
-git clone -b Kunal https://github.com/KJ-CORE/semicon_2026.git
+git clone -b Kunal https://github.com/kmbeddedd/semicon_2026.git
 cd semicon_2026
 ```
 
@@ -243,7 +243,7 @@ python utils/generalization.py
 ### Option A: 1-Click Cloud Training on Google Colab
 Click the badge below to run the complete training pipeline on a free Google Colab GPU:
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/KJ-CORE/semicon_2026/blob/Kunal/train_colab.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kmbeddedd/semicon_2026/blob/Kunal/train_colab.ipynb)
 
 ### Option B: Local Training
 ```bash
