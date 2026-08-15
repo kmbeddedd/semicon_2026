@@ -110,11 +110,12 @@ class PairedSemiconDataset(Dataset):
         return inp.copy(), tgt.copy()
 
     def __getitem__(self, idx: int):
+        inp_path = self.input_paths[idx]
+
         if self.cache_in_memory and len(self.cached_inputs) > idx:
             inp_img = self.cached_inputs[idx].copy()
             tgt_img = self.cached_targets[idx].copy() if len(self.cached_targets) > idx else inp_img.copy()
         else:
-            inp_path = self.input_paths[idx]
             inp_raw = self._load_image(inp_path)
             inp_img = robust_percentile_normalize(inp_raw)
             if self.target_paths and idx < len(self.target_paths):
