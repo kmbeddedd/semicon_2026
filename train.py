@@ -175,6 +175,7 @@ def main():
             val_psnr_ema = sum(val_psnrs_ema) / len(val_psnrs_ema)
             val_ssim_ema = sum(val_ssims_ema) / len(val_ssims_ema)
 
+        cur_lr = scheduler.get_last_lr()[0]
         eff_ema = relative_ceiling_efficiency(val_psnr_ema, 38.72, 20.14)
         print(f"Epoch [{epoch:03d}/{args.epochs:03d}] (LR: {cur_lr:.6f}) - Loss: {avg_loss:.4f} [C:{avg_parts['charb']:.3f}|E:{avg_parts['edge']:.3f}|F:{avg_parts['fft']:.3f}|S:{avg_parts['ssim']:.3f}] | Val PSNR: {val_psnr:.2f}dB (EMA: {val_psnr_ema:.2f}dB, {eff_ema:.1f}% ceiling) | Val SSIM: {val_ssim:.4f} (EMA: {val_ssim_ema:.4f})")
 
