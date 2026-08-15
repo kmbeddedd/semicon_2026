@@ -102,13 +102,15 @@ def auto_detect_dataset_paths(args):
             if not os.path.exists(val_lr_dir):
                 os.makedirs(val_lr_dir, exist_ok=True)
                 os.makedirs(val_gt_dir, exist_ok=True)
-                exts = ('*.npy', '*.png', '*.jpg', '*.tif')
+                exts = ('*.npy', '*.NPY', '*.png', '*.PNG', '*.jpg', '*.JPG', '*.jpeg', '*.JPEG', '*.tif', '*.TIF')
                 files = []
                 for e in exts:
                     files.extend(glob.glob(os.path.join(args.train_input, e)))
-                if files:
+                files = sorted(list(set(files)))
+                if len(files) > 0:
                     random.seed(42)
                     val_k = max(1, int(len(files) * 0.1))
+                    val_k = min(val_k, len(files))
                     val_files = random.sample(files, k=val_k)
                     for vf in val_files:
                         fn = os.path.basename(vf)
@@ -139,10 +141,14 @@ def main():
 
     # Dataset & DataLoader
     if not os.path.exists(args.train_input) or not os.path.exists(args.train_target):
-        print(f"[Metrology Training] Dataset directory not found: '{args.train_input}'. Please verify paths.")
+        print(f"[Metrology Training] ERROR: Dataset directory not found: '{args.train_input}'. Please verify paths.")
         return
 
     train_ds = PairedSemiconDataset(args.train_input, args.train_target, is_train=True, patch_size=args.patch_size, scale_factor=args.scale)
+    if len(train_ds) == 0:
+        print(f"[Metrology Training] ERROR: No valid training image pairs found in '{args.train_input}' and '{args.train_target}'.")
+        return
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -152,7 +158,9 @@ def main():
         persistent_workers=(args.num_workers > 0)
     )
 
-    val_ds = PairedSemiconDataset(args.val_input, args.val_target, is_train=False, scale_factor=args.scale) if os.path.exists(args.val_input) else None
+    val_ds = PairedSemiconDataset(args.val_input, args.val_target, is_train=False, scale_factor=args.scale) if (os.path.exists(args.val_input) and os.path.exists(args.val_target)) else None
+    if val_ds and len(val_ds) == 0:
+        val_ds = None
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=(device.type == "cuda")) if val_ds else None
 
     # Model Architecture with Bicubic Skip

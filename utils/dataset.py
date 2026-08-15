@@ -26,24 +26,31 @@ class PairedSemiconDataset(Dataset):
         self.patch_size = patch_size  # 0 = full image (128x128), >0 = random crop
         self.scale_factor = scale_factor
 
-        valid_exts = ('*.npy', '*.png', '*.jpg', '*.jpeg', '*.tif', '*.tiff', '*.bmp')
-        self.input_paths = []
+        valid_exts = ('*.npy', '*.NPY', '*.png', '*.PNG', '*.jpg', '*.JPG', '*.jpeg', '*.JPEG', '*.tif', '*.TIF', '*.tiff', '*.TIFF', '*.bmp', '*.BMP')
+        all_inputs = []
         for ext in valid_exts:
-            self.input_paths.extend(glob(os.path.join(input_dir, ext)))
-        self.input_paths = sorted(self.input_paths)
+            all_inputs.extend(glob(os.path.join(input_dir, ext)))
+        all_inputs = sorted(list(set(all_inputs)))
+
+        self.input_paths = []
+        self.target_paths = []
 
         if target_dir and os.path.exists(target_dir):
-            self.target_paths = [
-                os.path.join(target_dir, os.path.basename(p)) for p in self.input_paths
-            ]
+            for inp_p in all_inputs:
+                fname = os.path.basename(inp_p)
+                tgt_p = os.path.join(target_dir, fname)
+                if os.path.exists(tgt_p):
+                    self.input_paths.append(inp_p)
+                    self.target_paths.append(tgt_p)
         else:
+            self.input_paths = all_inputs
             self.target_paths = None
 
     def __len__(self):
         return len(self.input_paths)
 
     def _load_image(self, path: str) -> np.ndarray:
-        if path.endswith('.npy'):
+        if path.lower().endswith('.npy'):
             img = np.load(path).astype(np.float32)
             if img.ndim == 3:
                 img = img.squeeze()
