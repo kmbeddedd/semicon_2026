@@ -247,12 +247,15 @@ python utils/generalization.py
 
 ## 🏋️ Reproduce Training
 
-### Option A: 1-Click Cloud Training on Google Colab
-Click the badge below to run the complete training pipeline on a free Google Colab GPU:
-
+### Option A: 1-Click Cloud Training on Google Colab (Single T4 GPU)
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kmbeddedd/semicon_2026/blob/Kunal/train_colab.ipynb)
 
-### Option B: Local Training
+### Option B: Distributed Cloud Training on Kaggle (Dual Tesla T4 x2 GPUs)
+Use the included [`train_kaggle.ipynb`](file:///d:/Education/Project/SemiCon/train_kaggle.ipynb) notebook on Kaggle with Accelerator set to **GPU T4 x2**:
+* Uses **PyTorch `DataParallel`** to split mini-batches (`batch_size=64`, 32 per GPU).
+* Completes 100 epochs in **under 12 minutes** with Automatic Mixed Precision (`AMP FP16`).
+
+### Option C: Local Training
 ```bash
 python train.py --train_input data/train/NoisyLR --train_target data/train/GT --val_input data/val/NoisyLR --val_target data/val/GT --epochs 100 --batch_size 16 --lr 5e-4 --scale 2
 ```

@@ -24,3 +24,6 @@ __MACOSX/
 .idea/
 .vscode/
 *.pptx
+
+# Local Agent Workspace Configs
+.agents/

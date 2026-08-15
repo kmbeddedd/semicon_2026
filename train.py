@@ -75,8 +75,14 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=(device.type == "cuda")) if val_ds else None
 
     # Model Architecture with Bicubic Skip
-    model = NAFNetSR(in_channels=1, out_channels=1, width=64, scale_factor=args.scale).to(device)
-    ema = ModelEMA(model, decay=args.ema_decay)
+    raw_model = NAFNetSR(in_channels=1, out_channels=1, width=64, scale_factor=args.scale).to(device)
+    ema = ModelEMA(raw_model, decay=args.ema_decay)
+
+    if torch.cuda.device_count() > 1:
+        print(f"[Metrology Training] Multi-GPU Detected: Distributing across {torch.cuda.device_count()} GPUs (T4 x2) with DataParallel!")
+        model = torch.nn.DataParallel(raw_model)
+    else:
+        model = raw_model
 
     # Optimizer & LR Scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4, betas=(0.9, 0.99))
@@ -133,7 +139,8 @@ def main():
             scaler.step(optimizer)
             scaler.update()
 
-            ema.update(model)
+            raw_m = model.module if hasattr(model, "module") else model
+            ema.update(raw_m)
 
             running_loss += loss.item()
             for k in running_parts:
@@ -179,18 +186,21 @@ def main():
         eff_ema = relative_ceiling_efficiency(val_psnr_ema, 38.72, 20.14)
         print(f"Epoch [{epoch:03d}/{args.epochs:03d}] (LR: {cur_lr:.6f}) - Loss: {avg_loss:.4f} [C:{avg_parts['charb']:.3f}|E:{avg_parts['edge']:.3f}|F:{avg_parts['fft']:.3f}|S:{avg_parts['ssim']:.3f}] | Val PSNR: {val_psnr:.2f}dB (EMA: {val_psnr_ema:.2f}dB, {eff_ema:.1f}% ceiling) | Val SSIM: {val_ssim:.4f} (EMA: {val_ssim_ema:.4f})")
 
+        raw_m = model.module if hasattr(model, "module") else model
+        model_sd = raw_m.state_dict()
+
         # Save Latest Checkpoint
         save_path = os.path.join(args.save_dir, "latest_model.pt")
         torch.save({
             "epoch": epoch,
-            "state_dict": model.state_dict(),
+            "state_dict": model_sd,
             "ema_state_dict": ema.ema_model.state_dict(),
             "optimizer": optimizer.state_dict()
         }, save_path)
 
         # Select higher of model or EMA for best checkpoint
         best_val = max(val_psnr, val_psnr_ema)
-        best_weights = ema.ema_model.state_dict() if val_psnr_ema >= val_psnr else model.state_dict()
+        best_weights = ema.ema_model.state_dict() if val_psnr_ema >= val_psnr else model_sd
 
         if best_val > best_psnr:
             best_psnr = best_val
