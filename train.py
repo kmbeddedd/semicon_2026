@@ -54,19 +54,17 @@ def auto_detect_dataset_paths(args):
 
     print("[Dataset Auto-Detect] Checking /kaggle/input, /content, and local directories...")
 
-    # Check for zip files in /kaggle/input/ or root
-    search_dirs = ["/kaggle/input", "/kaggle/working", "/content", "data", "."]
+    # Check for zip files in dataset/ or /kaggle/input/ or root
+    search_dirs = ["dataset", "/kaggle/input", "/kaggle/working", "/content", "data", "."]
     for s_dir in search_dirs:
         if os.path.exists(s_dir):
-            for z in glob.glob(os.path.join(s_dir, "**/*.zip"), recursive=True):
-                if any(k in z.lower() for k in ["train", "semicon", "dataset", "noisylr"]):
-                    print(f"[Dataset Auto-Detect] Found zip archive: '{z}'. Extracting to 'data/'...")
+            for z in sorted(glob.glob(os.path.join(s_dir, "**/*.zip"), recursive=True)):
+                if any(k in z.lower() for k in ["train", "semicon", "dataset", "noisylr", "gt", "val", "test"]):
+                    print(f"[Dataset Auto-Detect] Extracting archive: '{z}' -> 'data/'...")
                     os.makedirs("data", exist_ok=True)
                     try:
                         with zipfile.ZipFile(z, 'r') as zip_ref:
                             zip_ref.extractall("data")
-                        print("[Dataset Auto-Detect] Extraction complete!")
-                        break
                     except Exception as e:
                         print(f"[Dataset Auto-Detect] Zip extraction note: {e}")
 
