@@ -34,6 +34,16 @@ def psnr_ceiling(sigma: float, peak: float = 1.0) -> float:
     mse_floor = max(sigma ** 2, 1e-14)
     return float(10.0 * np.log10((peak ** 2) / mse_floor))
 
+def relative_ceiling_efficiency(psnr: float, ceiling: float, bicubic_baseline: float = 20.14) -> float:
+    """
+    Gain-normalized theoretical restoration efficiency:
+    Efficiency = (PSNR - PSNR_bicubic) / (PSNR_ceiling - PSNR_bicubic) * 100%
+    """
+    denom = ceiling - bicubic_baseline
+    if denom <= 0:
+        return 0.0
+    return float(np.clip((psnr - bicubic_baseline) / denom * 100.0, 0.0, 100.0))
+
 def compute_dataset_noise_ceiling(gt_images: List[np.ndarray]) -> Dict[str, float]:
     """
     Computes noise floor sigma and theoretical PSNR ceiling across a collection of GT images.

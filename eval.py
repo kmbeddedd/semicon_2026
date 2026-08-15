@@ -9,11 +9,17 @@ from models.nafnet import NAFNetSR
 from utils.dataset import robust_percentile_normalize
 from utils.metrics import compute_psnr, compute_ssim, wavelet_noise_sigma, psnr_ceiling, relative_ceiling_efficiency
 
+try:
+    import lpips
+    HAS_LPIPS = True
+except ImportError:
+    HAS_LPIPS = False
+
 def parse_args():
     parser = argparse.ArgumentParser(description="High-Precision Evaluation & Inference Pipeline for Semiconductor Restoration")
     parser.add_argument("--input_dir", "-i", type=str, required=True, help="Path to input degraded images directory")
     parser.add_argument("--output_dir", "-o", type=str, required=True, help="Path to output directory for restored images")
-    parser.add_argument("--target_dir", "-t", type=str, default=None, help="Optional Ground Truth directory to compute benchmark PSNR/SSIM and ceiling")
+    parser.add_argument("--target_dir", "-t", type=str, default=None, help="Optional Ground Truth directory to compute benchmark PSNR/SSIM/LPIPS")
     parser.add_argument("--weights", "-w", type=str, default="weights/best_model.pt", help="Path to trained model checkpoint (.pt)")
     parser.add_argument("--scale", type=int, default=2, help="Scale factor (1 for denoising, 2 for 2x super-resolution)")
     parser.add_argument("--no_tta", action="store_true", help="Disable 8-Fold Test-Time Augmentation (TTA)")
@@ -66,6 +72,14 @@ def main():
     model.to(device)
     model.eval()
 
+    # Perceptual Loss Setup
+    lpips_fn = None
+    if HAS_LPIPS and args.target_dir and os.path.exists(args.target_dir):
+        try:
+            lpips_fn = lpips.LPIPS(net='alex').to(device).eval()
+        except Exception:
+            lpips_fn = None
+
     use_tta = not args.no_tta
     print(f"[Metrology Eval] 8-Fold Test-Time Augmentation (TTA): {use_tta}")
 
@@ -82,7 +96,7 @@ def main():
 
     print(f"[Metrology Eval] Processing {len(img_paths)} images...")
     total_time = 0.0
-    psnr_scores, ssim_scores = [], []
+    psnr_scores, ssim_scores, lpips_scores = [], [], []
     gt_ceilings, gt_sigmas = [], []
 
     with torch.no_grad():
@@ -131,6 +145,13 @@ def main():
                     gt_sigmas.append(s_gt)
                     gt_ceilings.append(psnr_ceiling(s_gt))
 
+                    # Compute LPIPS if initialized
+                    if lpips_fn is not None:
+                        t_pred = torch.from_numpy(out_clamped).unsqueeze(0).unsqueeze(0).repeat(1, 3, 1, 1).to(device) * 2.0 - 1.0
+                        t_gt = torch.from_numpy(gt_clamped).unsqueeze(0).unsqueeze(0).repeat(1, 3, 1, 1).to(device) * 2.0 - 1.0
+                        lpips_val = lpips_fn(t_pred, t_gt).item()
+                        lpips_scores.append(lpips_val)
+
             # Save restored outputs
             if fname.endswith('.npy'):
                 save_npy_path = os.path.join(args.output_dir, fname)
@@ -142,22 +163,26 @@ def main():
                 cv2.imwrite(save_path, (out_clamped * 255.0).astype(np.uint8))
 
     avg_time = total_time / max(len(img_paths), 1)
+    fps = 1000.0 / max(avg_time, 1e-3)
     print(f"\n[Metrology Eval] Completed! Processed {len(img_paths)} images.")
-    print(f"[Metrology Eval] Average Inference Latency: {avg_time:.2f} ms / frame.")
+    print(f"[Metrology Eval] Average Inference Latency: {avg_time:.2f} ms / frame ({fps:.1f} FPS / img/s).")
     print(f"[Metrology Eval] Restored outputs saved to: '{args.output_dir}'")
 
     if psnr_scores:
         mean_psnr = np.mean(psnr_scores)
         mean_ssim = np.mean(ssim_scores)
         mean_ceiling = np.mean(gt_ceilings)
-        eff = relative_ceiling_efficiency(mean_psnr, mean_ceiling)
+        eff = relative_ceiling_efficiency(mean_psnr, mean_ceiling, bicubic_baseline=20.14)
         margin = mean_ceiling - mean_psnr
 
         print(f"\n[Metrology Eval] Benchmark Metrics across {len(psnr_scores)} Ground Truth pairs:")
         print(f"  [+] Average Restored PSNR:    {mean_psnr:.2f} dB")
         print(f"  [+] Average Restored SSIM:    {mean_ssim:.4f}")
+        if lpips_scores:
+            print(f"  [+] Average Restored LPIPS:   {np.mean(lpips_scores):.4f} (AlexNet, lower is better)")
         print(f"  [+] Physical GT Noise Ceiling:{mean_ceiling:.2f} dB (Wavelet-MAD sigma: {np.mean(gt_sigmas):.6f})")
-        print(f"  [+] Ceiling Efficiency:       {eff:.1f}% of theoretical maximum (-{margin:.2f} dB from noise ceiling)")
+        print(f"  [+] Gain-Normalized Ceiling:  {eff:.1f}% of theoretical max potential (formula: (PSNR - 20.14) / (Ceiling - 20.14))")
+        print(f"  [+] Absolute Noise Margin:    -{margin:.2f} dB from theoretical GT ceiling")
 
     if args.check_clean_damage and args.target_dir and os.path.exists(args.target_dir):
         print(f"\n[Metrology Eval] Running Clean-Input Degradation Audit...")
