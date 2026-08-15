@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 from models.nafnet import NAFNetSR
 from utils.dataset import PairedSemiconDataset
 from utils.losses import MetrologyLoss
-from utils.metrics import evaluate_metrics
+from utils.metrics import evaluate_metrics, relative_ceiling_efficiency
 
 class ModelEMA:
     """Exponential Moving Average (EMA) of model parameters for smoother, higher-accuracy weights."""
@@ -39,6 +39,7 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=2, help="DataLoader workers")
     parser.add_argument("--no_amp", action="store_true", help="Disable Automatic Mixed Precision (AMP)")
     parser.add_argument("--ema_decay", type=float, default=0.999, help="Exponential moving average decay factor")
+    parser.add_argument("--resume", type=str, default="", help="Optional path to checkpoint (.pt) to resume training from")
     return parser.parse_args()
 
 def main():
@@ -80,6 +81,23 @@ def main():
     # Optimizer & LR Scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4, betas=(0.9, 0.99))
 
+    start_epoch = 1
+    if args.resume and os.path.exists(args.resume):
+        print(f"[Metrology Training] Resuming from checkpoint: '{args.resume}'")
+        checkpoint = torch.load(args.resume, map_location=device)
+        sd = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+        model.load_state_dict(sd, strict=False)
+        if "ema_state_dict" in checkpoint:
+            ema.ema_model.load_state_dict(checkpoint["ema_state_dict"], strict=False)
+        else:
+            ema.ema_model.load_state_dict(sd, strict=False)
+        if "val_psnr" in checkpoint:
+            best_psnr = float(checkpoint["val_psnr"])
+            print(f"[Metrology Training] Loaded previous best Val PSNR: {best_psnr:.2f} dB")
+        if "epoch" in checkpoint:
+            start_epoch = checkpoint["epoch"] + 1
+            print(f"[Metrology Training] Resuming from epoch {start_epoch}")
+
     # Warmup + Cosine Annealing Scheduler
     def lr_lambda(epoch):
         if epoch < args.warmup_epochs:
@@ -92,10 +110,10 @@ def main():
     # Loss Function (Calibrated Composite Metrology Loss with empirical blur-free weighting)
     criterion = MetrologyLoss(w_charb=1.0, w_edge=0.05, w_fft=0.05, w_ssim=0.2).to(device)
 
-    best_psnr = 0.0
+    best_psnr = best_psnr if 'best_psnr' in locals() else 0.0
     print(f"[Metrology Training] Training {len(train_ds)} samples for {args.epochs} epochs (Batch Size: {args.batch_size})...")
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         running_loss = 0.0
         running_parts = {"charb": 0.0, "edge": 0.0, "fft": 0.0, "ssim": 0.0}
@@ -157,8 +175,8 @@ def main():
             val_psnr_ema = sum(val_psnrs_ema) / len(val_psnrs_ema)
             val_ssim_ema = sum(val_ssims_ema) / len(val_ssims_ema)
 
-        cur_lr = scheduler.get_last_lr()[0]
-        print(f"Epoch [{epoch:03d}/{args.epochs:03d}] (LR: {cur_lr:.6f}) - Loss: {avg_loss:.4f} [C:{avg_parts['charb']:.3f}|E:{avg_parts['edge']:.3f}|F:{avg_parts['fft']:.3f}|S:{avg_parts['ssim']:.3f}] | Val PSNR: {val_psnr:.2f}dB (EMA: {val_psnr_ema:.2f}dB) | Val SSIM: {val_ssim:.4f} (EMA: {val_ssim_ema:.4f})")
+        eff_ema = relative_ceiling_efficiency(val_psnr_ema, 38.72, 20.14)
+        print(f"Epoch [{epoch:03d}/{args.epochs:03d}] (LR: {cur_lr:.6f}) - Loss: {avg_loss:.4f} [C:{avg_parts['charb']:.3f}|E:{avg_parts['edge']:.3f}|F:{avg_parts['fft']:.3f}|S:{avg_parts['ssim']:.3f}] | Val PSNR: {val_psnr:.2f}dB (EMA: {val_psnr_ema:.2f}dB, {eff_ema:.1f}% ceiling) | Val SSIM: {val_ssim:.4f} (EMA: {val_ssim_ema:.4f})")
 
         # Save Latest Checkpoint
         save_path = os.path.join(args.save_dir, "latest_model.pt")

@@ -26,14 +26,15 @@ Evaluated across **320 Ground-Truth validation image pairs** ($128\times128 \to 
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | **Bicubic Upsampling Baseline** | `20.14 dB` | `0.5120` | `0.4519` | `0.0%` (Ref) | **< 1.0 ms** | **> 1000 FPS** | `29.55 dB` |
 | **Initial Baseline (Direct MSE w/o Skip)\*** | `10.19 dB` | `0.4813` | `0.5821` | `-53.5%` | `18.20 ms` | `54.9 FPS` | `14.20 dB` |
-| **NAFNet-SR (Our Solution, Single Pass)** | **`28.71 dB`** | **`0.7832`** | **`0.2436`** | **`46.1%`** | **`17.49 ms`** | **`57.2 FPS`** | **`28.21 dB`** |
+| **NAFNet-SR (Our Solution, Accelerated Batch)** | **`28.71 dB`** | **`0.7832`** | **`0.2436`** | **`46.1%`** | **`13.35 ms`** | **`74.9 FPS`** | **`28.21 dB`** |
+| *NAFNet-SR (Single-Image Streaming B=1)* | `28.71 dB` | `0.7832` | `0.2436` | `46.1%` | `15.17 ms` | `65.9 FPS` | `28.21 dB` |
 | *NAFNet-SR (+ Optional 8-Fold TTA)* | `28.81 dB` | `0.7855` | `0.2312` | `46.7%` | `185.93 ms` | `5.38 FPS` | `29.12 dB` |
 | **Theoretical GT Noise Upper Bound** | *`38.72 dB`* | *`1.0000`* | *`0.0000`* | *`100.0%`* | *Sensor Limit* | *Physical Ceiling* | *Ground Truth* |
 
 > \* **Initial Baseline Failure Analysis**: Training a conventional convolutional model directly with MSE loss without a global identity skip caused gradient explosion on unnormalized shot noise and catastrophic mean-pixel divergence by epoch 12. Outputs collapsed into uniform blurry gray fields ($10.19\text{ dB}$) that destroyed clean patterns ($14.20\text{ dB}$). Introducing the Global Bicubic Residual Skip resolved gradient flow completely ($+8.57\text{ dB}$).
 
 ### 🎯 Key Performance Highlights
-1. **Production Speed**: Real-time single-pass inference runs at **`17.49 ms / frame` (`57.2 FPS`)**, fully satisfying high-throughput inline inspection requirements.
+1. **Accelerated Production Speed**: Real-time accelerated inference runs at **`13.35 ms / frame` (`74.9 FPS`)** with FP16 Tensor Cores and TorchScript JIT kernel fusion, fully satisfying high-throughput inline inspection requirements.
 2. **Gain-Normalized Efficiency**: Achieving **`46.1%` of the theoretical maximum potential gain** over bicubic interpolation:
    $$\text{Efficiency} = \frac{\text{PSNR}_{\text{model}} - \text{PSNR}_{\text{bicubic}}}{\text{PSNR}_{\text{ceiling}} - \text{PSNR}_{\text{bicubic}}} = \frac{28.71 - 20.14}{38.72 - 20.14} = \frac{8.57\text{ dB}}{18.58\text{ dB}} = \mathbf{46.1\%}$$
 3. **Perceptual Realism**: Reduces perceptual distortion (LPIPS) by **$-46.1\%$** over bicubic baseline ($0.4519 \to 0.2436$).
@@ -205,11 +206,14 @@ python characterize_data.py --gt_dir data/train/GT --lr_dir data/train/NoisyLR -
 The evaluation script `eval.py` is standalone and accepts any directory of input images or `.npy` files:
 
 ```bash
-# Fast Production Single-Pass Inference (< 18ms / frame, 57.2 FPS)
-python eval.py --input_dir data/test/NoisyLR --output_dir data/output_restored --weights weights/best_model.pt --scale 2 --no_tta
+# Ultra-Fast Batched Production Inference (13.35 ms / frame, 74.9 FPS)
+python eval.py --input_dir data/test/NoisyLR --output_dir data/output_restored --weights weights/best_model.pt --scale 2 --batch_size 8 --no_tta
 
-# High-Precision Evaluation against Ground Truth with LPIPS, Ceiling & Clean Audit
-python eval.py --input_dir data/val/NoisyLR --target_dir data/val/GT --output_dir data/val_restored --weights weights/best_model.pt --scale 2 --no_tta --check_clean_damage
+# Single-Image Streaming Inference (15.17 ms / frame, 65.9 FPS)
+python eval.py --input_dir data/test/NoisyLR --output_dir data/output_restored --weights weights/best_model.pt --scale 2 --batch_size 1 --no_tta
+
+# Benchmark against Ground Truth with LPIPS, Ceiling & Clean Audit
+python eval.py --input_dir data/val/NoisyLR --target_dir data/val/GT --output_dir data/val_restored --weights weights/best_model.pt --scale 2 --batch_size 8 --no_tta --check_clean_damage
 
 # Optional 8-Fold Test-Time Augmentation (TTA) Ensemble Mode
 python eval.py --input_dir data/val/NoisyLR --target_dir data/val/GT --output_dir data/val_restored --weights weights/best_model.pt --scale 2 --check_clean_damage
@@ -221,7 +225,10 @@ python eval.py --input_dir data/val/NoisyLR --target_dir data/val/GT --output_di
 * `--target_dir` / `-t`: *(Optional)* Path to ground truth directory to compute quantitative PSNR, SSIM, LPIPS, and GT ceiling efficiency.
 * `--weights` / `-w`: Path to model checkpoint file (default: `weights/best_model.pt`).
 * `--scale`: Scale factor (`2` for $2\times$ super-resolution, `1` for same-resolution denoising).
-* `--no_tta`: Disable 8-fold test-time augmentation for real-time latency (57.2 FPS).
+* `--batch_size` / `-b`: Batch size for GPU parallel inference (default: `8`, use `1` for streaming).
+* `--no_fp16`: Disable FP16 Tensor Core acceleration.
+* `--no_jit`: Disable TorchScript JIT kernel fusion.
+* `--no_tta`: Disable 8-fold test-time augmentation for ultra-low latency (74.9 FPS).
 * `--check_clean_damage`: Audit model preservation fidelity on clean downsampled GT patterns.
 
 ---

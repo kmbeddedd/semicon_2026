@@ -154,8 +154,8 @@ class NAFNetSR(nn.Module):
             self.noise_gate = None
 
     def forward(self, inp, noise_stats=None):
-        # Extract primary intensity channel for bicubic base if multi-channel input
-        raw_inp = inp[:, :1, :, :] if inp.shape[1] > 1 else inp
+        # Extract primary intensity channel for bicubic base (cleanly JIT trace compatible)
+        raw_inp = inp[:, :1, :, :]
         x = self.intro(inp)
         skips = []
 
