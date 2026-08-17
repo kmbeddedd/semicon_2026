@@ -1,4 +1,7 @@
 import unittest
+import os
+import tempfile
+from types import SimpleNamespace
 import numpy as np
 import torch
 from utils.signal_analysis import (
@@ -13,6 +16,9 @@ from utils.signal_analysis import (
 )
 from utils.losses import MetrologyLoss, FFTLoss, SSIMLoss, SobelEdgeLoss, CharbonnierLoss
 from models.nafnet import NAFNetSR
+from utils.dataset import PairedSemiconDataset
+from train import warmup_cosine_factor, load_model_state_strict, ensure_validation_split
+from eval import predict_tta_batched
 
 class TestSignalProcessing(unittest.TestCase):
 
@@ -65,6 +71,97 @@ class TestSignalProcessing(unittest.TestCase):
         out = model(inp)
         self.assertEqual(out.shape, (1, 1, 64, 64))
 
+    def test_nafnet_configuration_and_noise_gate_contract(self):
+        with self.assertRaises(ValueError):
+            NAFNetSR(width=8, enc_blocks=(1, 1), dec_blocks=(1,), scale_factor=2)
+
+        model = NAFNetSR(width=8, enc_blocks=(1,), dec_blocks=(1,), scale_factor=2, use_noise_gate=True).eval()
+        inp = torch.rand(2, 1, 8, 8)
+        with self.assertRaises(ValueError):
+            model(inp)
+        out = model(inp, noise_stats=torch.tensor([[0.05, 0.5], [0.01, 0.5]]))
+        self.assertEqual(out.shape, (2, 1, 16, 16))
+
+    def test_training_output_preserves_out_of_range_gradients(self):
+        model = NAFNetSR(width=8, enc_blocks=(1,), dec_blocks=(1,), scale_factor=2)
+        inp = torch.ones(1, 1, 8, 8) * 2.0
+        train_out = model.train()(inp)
+        eval_out = model.eval()(inp)
+        self.assertGreater(train_out.max().item(), 1.0)
+        self.assertLessEqual(eval_out.max().item(), 1.0)
+
+    def test_scheduler_transition_and_strict_checkpoint_loading(self):
+        self.assertAlmostEqual(warmup_cosine_factor(0, 5, 100), 0.2)
+        self.assertAlmostEqual(warmup_cosine_factor(4, 5, 100), 1.0)
+        self.assertAlmostEqual(warmup_cosine_factor(5, 5, 100), 1.0)
+        self.assertAlmostEqual(warmup_cosine_factor(100, 5, 100), 0.0)
+
+        source = NAFNetSR(width=8, enc_blocks=(1,), dec_blocks=(1,), scale_factor=2)
+        target = NAFNetSR(width=8, enc_blocks=(1,), dec_blocks=(1,), scale_factor=2)
+        prefixed = {f"module.{key}": value for key, value in source.state_dict().items()}
+        load_model_state_strict(target, prefixed)
+        for source_param, target_param in zip(source.parameters(), target.parameters()):
+            self.assertTrue(torch.equal(source_param, target_param))
+
+        incomplete = dict(source.state_dict())
+        incomplete.pop(next(iter(incomplete)))
+        with self.assertRaises(RuntimeError):
+            load_model_state_strict(target, incomplete)
+
+    def test_dataset_pair_validation_and_clipping(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            input_dir = os.path.join(tmp_dir, "input")
+            target_dir = os.path.join(tmp_dir, "target")
+            os.makedirs(input_dir)
+            os.makedirs(target_dir)
+            np.save(os.path.join(input_dir, "sample.npy"), np.linspace(-0.5, 1.5, 64, dtype=np.float32).reshape(8, 8))
+            np.save(os.path.join(target_dir, "sample.npy"), np.ones((16, 16), dtype=np.float32))
+
+            dataset = PairedSemiconDataset(input_dir, target_dir, scale_factor=2, cache_in_memory=False)
+            inp, target, name = dataset[0]
+            self.assertEqual(name, "sample.npy")
+            self.assertEqual(tuple(inp.shape), (1, 8, 8))
+            self.assertEqual(tuple(target.shape), (1, 16, 16))
+            self.assertGreaterEqual(inp.min().item(), 0.0)
+            self.assertLessEqual(inp.max().item(), 1.0)
+
+            np.save(os.path.join(target_dir, "sample.npy"), np.ones((15, 16), dtype=np.float32))
+            with self.assertRaises(ValueError):
+                dataset[0]
+
+    def test_validation_split_is_paired_and_non_overlapping(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            train_input = os.path.join(tmp_dir, "train_input")
+            train_target = os.path.join(tmp_dir, "train_target")
+            val_input = os.path.join(tmp_dir, "val_input")
+            val_target = os.path.join(tmp_dir, "val_target")
+            os.makedirs(train_input)
+            os.makedirs(train_target)
+            for index in range(10):
+                filename = f"{index:03d}.npy"
+                np.save(os.path.join(train_input, filename), np.zeros((8, 8), dtype=np.float32))
+                np.save(os.path.join(train_target, filename), np.zeros((16, 16), dtype=np.float32))
+
+            args = SimpleNamespace(
+                train_input=train_input,
+                train_target=train_target,
+                val_input=val_input,
+                val_target=val_target,
+                seed=42,
+            )
+            ensure_validation_split(args)
+            train_names = set(os.listdir(train_input))
+            val_names = set(os.listdir(val_input))
+            self.assertEqual(len(train_names), 9)
+            self.assertEqual(len(val_names), 1)
+            self.assertFalse(train_names & val_names)
+            self.assertEqual(val_names, set(os.listdir(val_target)))
+
+    def test_tta_identity(self):
+        inp = torch.rand(2, 1, 16, 16)
+        out = predict_tta_batched(torch.nn.Identity(), inp)
+        self.assertTrue(torch.allclose(out, inp, atol=1e-7))
+
     def test_losses_fp32_safety(self):
         criterion = MetrologyLoss(w_charb=1.0, w_edge=0.05, w_fft=0.05, w_ssim=0.2)
         pred = torch.rand(2, 1, 64, 64, requires_grad=True)
@@ -77,6 +174,18 @@ class TestSignalProcessing(unittest.TestCase):
         loss.backward()
         self.assertIsNotNone(pred.grad)
         self.assertFalse(torch.isnan(pred.grad).any())
+        self.assertEqual(loss.dtype, torch.float32)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for the AMP regression test")
+    def test_losses_remain_fp32_under_amp(self):
+        criterion = MetrologyLoss().cuda()
+        pred = torch.rand(2, 1, 32, 32, device="cuda", dtype=torch.float16, requires_grad=True)
+        target = torch.rand(2, 1, 32, 32, device="cuda", dtype=torch.float16)
+        with torch.amp.autocast("cuda"):
+            loss, _ = criterion(pred, target)
+        self.assertEqual(loss.dtype, torch.float32)
+        loss.backward()
+        self.assertTrue(torch.isfinite(pred.grad).all())
 
 if __name__ == '__main__':
     unittest.main()

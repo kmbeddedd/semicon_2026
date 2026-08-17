@@ -56,6 +56,8 @@ class NAFBlock(nn.Module):
 
         self.norm1 = LayerNorm2d(c)
         self.norm2 = LayerNorm2d(c)
+        self.dropout1 = nn.Dropout(drop_out_rate) if drop_out_rate > 0 else nn.Identity()
+        self.dropout2 = nn.Dropout(drop_out_rate) if drop_out_rate > 0 else nn.Identity()
 
         self.beta = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
         self.gamma = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
@@ -68,6 +70,7 @@ class NAFBlock(nn.Module):
         x = self.sg(x)
         x = self.sca(x)
         x = self.conv3(x)
+        x = self.dropout1(x)
         y = inp + x * self.beta
 
         # FFN Block
@@ -75,6 +78,7 @@ class NAFBlock(nn.Module):
         x = self.conv4(x)
         x = self.sg2(x)
         x = self.conv5(x)
+        x = self.dropout2(x)
         return y + x * self.gamma
 
 class NoiseGate(nn.Module):
@@ -102,10 +106,16 @@ class NAFNetSR(nn.Module):
     """
     NAFNet for Semiconductor Inspection Image Restoration & Super-Resolution.
     Handles joint Denoising (Speckle + Gaussian) and 2x Upscaling with Global Bicubic Residual Skip.
-    Supports optional NoiseGate conditioning and zero-initialized residual head.
+    Supports experimental optional NoiseGate conditioning and a zero-initialized residual head.
+    The bundled checkpoint was trained without NoiseGate conditioning.
     """
-    def __init__(self, in_channels=1, out_channels=1, width=64, enc_blocks=[2, 2, 2], dec_blocks=[2, 2, 2], scale_factor=2, use_noise_gate=False):
+    def __init__(self, in_channels=1, out_channels=1, width=64, enc_blocks=(2, 2, 2), dec_blocks=(2, 2, 2), scale_factor=2, use_noise_gate=False):
         super().__init__()
+        if len(enc_blocks) != len(dec_blocks):
+            raise ValueError("enc_blocks and dec_blocks must contain the same number of stages")
+        if scale_factor < 1 or int(scale_factor) != scale_factor:
+            raise ValueError("scale_factor must be a positive integer")
+        scale_factor = int(scale_factor)
         self.scale_factor = scale_factor
         self.use_noise_gate = use_noise_gate
         self.intro = nn.Conv2d(in_channels, width, kernel_size=3, padding=1)
@@ -185,9 +195,13 @@ class NAFNetSR(nn.Module):
             restored = res
 
         # Optional learned dynamic noise gating
-        if self.noise_gate is not None and noise_stats is not None:
+        if self.noise_gate is not None and noise_stats is None:
+            raise ValueError("noise_stats must be provided when use_noise_gate=True")
+        if self.noise_gate is not None:
             out = self.noise_gate(restored, base, noise_stats)
         else:
             out = restored
 
-        return torch.clamp(out, 0.0, 1.0)
+        # Preserve gradients for out-of-range training predictions; inference is
+        # clamped to the physical image range.
+        return out if self.training else torch.clamp(out, 0.0, 1.0)

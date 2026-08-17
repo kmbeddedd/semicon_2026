@@ -28,15 +28,18 @@ def wavelet_noise_sigma(img: np.ndarray, wavelet: str = 'db2') -> float:
 
 def psnr_ceiling(sigma: float, peak: float = 1.0) -> float:
     """
-    Theoretical maximum achievable PSNR (dB) bounded by the ground-truth noise floor:
+    Convert an estimated Ground-Truth noise sigma to its equivalent PSNR.
+
+    This is a descriptive noise-floor estimate, not a formal upper bound on
+    model-to-target PSNR.
     PSNR_ceiling = 10 * log10(peak^2 / sigma^2) = 20 * log10(peak / sigma)
     """
     mse_floor = max(sigma ** 2, 1e-14)
     return float(10.0 * np.log10((peak ** 2) / mse_floor))
 
-def relative_ceiling_efficiency(psnr: float, ceiling: float, bicubic_baseline: float = 20.14) -> float:
+def relative_ceiling_efficiency(psnr: float, ceiling: float, bicubic_baseline: float) -> float:
     """
-    Gain-normalized theoretical restoration efficiency:
+    Gain-normalized restoration estimate relative to a measured baseline:
     Efficiency = (PSNR - PSNR_bicubic) / (PSNR_ceiling - PSNR_bicubic) * 100%
     """
     denom = ceiling - bicubic_baseline
@@ -46,7 +49,7 @@ def relative_ceiling_efficiency(psnr: float, ceiling: float, bicubic_baseline: f
 
 def compute_dataset_noise_ceiling(gt_images: List[np.ndarray]) -> Dict[str, float]:
     """
-    Computes noise floor sigma and theoretical PSNR ceiling across a collection of GT images.
+    Computes Wavelet-MAD noise sigma and equivalent PSNR estimates across GT images.
     """
     sigmas = [wavelet_noise_sigma(img) for img in gt_images]
     ceilings = [psnr_ceiling(s) for s in sigmas]

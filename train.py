@@ -1,12 +1,100 @@
 import os
 import argparse
 import copy
+import math
+import random
+import glob
+import shutil
+import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from models.nafnet import NAFNetSR
 from utils.dataset import PairedSemiconDataset
 from utils.losses import MetrologyLoss
 from utils.metrics import evaluate_metrics, relative_ceiling_efficiency
+
+
+def seed_everything(seed: int, deterministic: bool = False):
+    """Seed training randomness and optionally request deterministic CUDA kernels."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
+
+def seed_worker(worker_id: int):
+    """Give each DataLoader worker a deterministic Python/NumPy seed."""
+    del worker_id
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
+def warmup_cosine_factor(epoch: int, warmup_epochs: int, total_epochs: int) -> float:
+    """Learning-rate multiplier for linear warmup followed by cosine decay."""
+    if epoch < warmup_epochs:
+        return float(epoch + 1) / float(max(1, warmup_epochs))
+    progress = float(epoch - warmup_epochs) / float(max(1, total_epochs - warmup_epochs))
+    progress = min(max(progress, 0.0), 1.0)
+    return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def load_model_state_strict(model: torch.nn.Module, state_dict):
+    """Load raw or DataParallel state dictionaries without silently dropping keys."""
+    if state_dict and all(key.startswith("module.") for key in state_dict):
+        state_dict = {key[len("module."):]: value for key, value in state_dict.items()}
+    model.load_state_dict(state_dict, strict=True)
+
+
+def ensure_validation_split(args):
+    """Create a deterministic, non-overlapping paired validation split when needed."""
+    valid_exts = ('*.npy', '*.NPY', '*.png', '*.PNG', '*.jpg', '*.JPG', '*.jpeg', '*.JPEG', '*.tif', '*.TIF')
+
+    if os.path.abspath(args.train_input) == os.path.abspath(args.val_input):
+        raise ValueError("Training and validation input directories must be different")
+    if os.path.abspath(args.train_target) == os.path.abspath(args.val_target):
+        raise ValueError("Training and validation target directories must be different")
+
+    existing_val_inputs = []
+    if os.path.exists(args.val_input) and os.path.exists(args.val_target):
+        for ext in valid_exts:
+            existing_val_inputs.extend(glob.glob(os.path.join(args.val_input, ext)))
+        existing_val_inputs = [
+            path for path in set(existing_val_inputs)
+            if os.path.exists(os.path.join(args.val_target, os.path.basename(path)))
+        ]
+        if existing_val_inputs:
+            return args
+
+    os.makedirs(args.val_input, exist_ok=True)
+    os.makedirs(args.val_target, exist_ok=True)
+    train_files = []
+    for ext in valid_exts:
+        train_files.extend(glob.glob(os.path.join(args.train_input, ext)))
+    train_files = sorted({
+        path for path in train_files
+        if os.path.exists(os.path.join(args.train_target, os.path.basename(path)))
+    })
+    if not train_files:
+        raise FileNotFoundError("Cannot create validation split because no paired training files were found.")
+
+    split_rng = random.Random(args.seed)
+    val_k = min(len(train_files), max(1, int(len(train_files) * 0.1)))
+    val_files = split_rng.sample(train_files, k=val_k)
+    for input_path in val_files:
+        filename = os.path.basename(input_path)
+        target_path = os.path.join(args.train_target, filename)
+        shutil.move(input_path, os.path.join(args.val_input, filename))
+        shutil.move(target_path, os.path.join(args.val_target, filename))
+    print(f"[Dataset Auto-Detect] Created non-overlapping 10% validation split: {len(val_files)} pairs")
+    return args
 
 class ModelEMA:
     """Exponential Moving Average (EMA) of model parameters for smoother, higher-accuracy weights."""
@@ -37,9 +125,12 @@ def parse_args():
     parser.add_argument("--scale", type=int, default=2, help="Scale factor (1 for same-res denoising, 2 for SR)")
     parser.add_argument("--patch_size", type=int, default=0, help="Patch size (0 for full 128x128 image)")
     parser.add_argument("--num_workers", type=int, default=2, help="DataLoader workers")
+    parser.add_argument("--no_cache", action="store_true", help="Disable in-memory dataset caching to reduce RAM use")
     parser.add_argument("--no_amp", action="store_true", help="Disable Automatic Mixed Precision (AMP)")
     parser.add_argument("--ema_decay", type=float, default=0.999, help="Exponential moving average decay factor")
     parser.add_argument("--resume", type=str, default="", help="Optional path to checkpoint (.pt) to resume training from")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducible training")
+    parser.add_argument("--deterministic", action="store_true", help="Prefer deterministic kernels over maximum throughput")
     return parser.parse_args()
 
 def auto_detect_dataset_paths(args):
@@ -47,10 +138,10 @@ def auto_detect_dataset_paths(args):
     Automatically detects and resolves training and validation paths on Kaggle, Colab, or local disks.
     If zip archives are found in /kaggle/input/ or current directory, extracts them automatically.
     """
-    import zipfile, glob, shutil, random
+    import zipfile
 
     if os.path.exists(args.train_input) and os.path.exists(args.train_target):
-        return args
+        return ensure_validation_split(args)
 
     print("[Dataset Auto-Detect] Checking /kaggle/input, /content, and local directories...")
 
@@ -92,55 +183,19 @@ def auto_detect_dataset_paths(args):
         if os.path.exists(args.train_input) and os.path.exists(args.train_target):
             break
 
-    # Auto-create 10% validation split if not present
-    if os.path.exists(args.train_input) and os.path.exists(args.train_target):
-        if not (os.path.exists(args.val_input) and os.path.exists(args.val_target)):
-            val_lr_dir = os.path.join("data", "val", "NoisyLR")
-            val_gt_dir = os.path.join("data", "val", "GT")
-            if not os.path.exists(val_lr_dir):
-                os.makedirs(val_lr_dir, exist_ok=True)
-                os.makedirs(val_gt_dir, exist_ok=True)
-                exts = ('*.npy', '*.NPY', '*.png', '*.PNG', '*.jpg', '*.JPG', '*.jpeg', '*.JPEG', '*.tif', '*.TIF')
-                files = []
-                for e in exts:
-                    files.extend(glob.glob(os.path.join(args.train_input, e)))
-                files = sorted(list(set(files)))
-                if len(files) > 0:
-                    random.seed(42)
-                    val_k = max(1, int(len(files) * 0.1))
-                    val_k = min(val_k, len(files))
-                    val_files = random.sample(files, k=val_k)
-                    for vf in val_files:
-                        fn = os.path.basename(vf)
-                        tgt_f = os.path.join(args.train_target, fn)
-                        shutil.copy(vf, os.path.join(val_lr_dir, fn))
-                        if os.path.exists(tgt_f):
-                            shutil.copy(tgt_f, os.path.join(val_gt_dir, fn))
-                    print(f"[Dataset Auto-Detect] Created 10% Val Split: {len(val_files)} samples in '{val_lr_dir}'")
-            args.val_input = val_lr_dir
-            args.val_target = val_gt_dir
-
-    return args
-
-def fast_val_metrics_gpu(pred, tgt):
-    mse = torch.mean((pred - tgt) ** 2)
-    psnr = 10.0 * torch.log10(1.0 / (mse + 1e-8))
-    mu_x, mu_y = pred.mean(), tgt.mean()
-    var_x = ((pred - mu_x) ** 2).mean()
-    var_y = ((tgt - mu_y) ** 2).mean()
-    cov_xy = ((pred - mu_x) * (tgt - mu_y)).mean()
-    c1, c2 = (0.01) ** 2, (0.03) ** 2
-    ssim = ((2 * mu_x * mu_y + c1) * (2 * cov_xy + c2)) / ((mu_x**2 + mu_y**2 + c1) * (var_x + var_y + c2))
-    return psnr.item(), ssim.item()
+    if not (os.path.exists(args.train_input) and os.path.exists(args.train_target)):
+        return args
+    return ensure_validation_split(args)
 
 def main():
     args = parse_args()
+    seed_everything(args.seed, deterministic=args.deterministic)
     args = auto_detect_dataset_paths(args)
     os.makedirs(args.save_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Metrology Training] Training on device: {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
 
-    if device.type == "cuda":
+    if device.type == "cuda" and not args.deterministic:
         torch.backends.cudnn.benchmark = True
         print("[Metrology Training] Enabled cuDNN Benchmark & Tensor Core optimization.")
 
@@ -153,27 +208,41 @@ def main():
         print(f"[Metrology Training] ERROR: Dataset directory not found: '{args.train_input}'. Please verify paths.")
         return
 
-    train_ds = PairedSemiconDataset(args.train_input, args.train_target, is_train=True, patch_size=args.patch_size, scale_factor=args.scale, cache_in_memory=True)
+    cache_in_memory = not args.no_cache
+    train_ds = PairedSemiconDataset(args.train_input, args.train_target, is_train=True, patch_size=args.patch_size, scale_factor=args.scale, cache_in_memory=cache_in_memory)
     if len(train_ds) == 0:
         print(f"[Metrology Training] ERROR: No valid training image pairs found in '{args.train_input}' and '{args.train_target}'.")
         return
 
+    train_generator = torch.Generator()
+    train_generator.manual_seed(args.seed)
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
-        persistent_workers=(args.num_workers > 0)
+        persistent_workers=(args.num_workers > 0),
+        worker_init_fn=seed_worker,
+        generator=train_generator
     )
 
-    val_ds = PairedSemiconDataset(args.val_input, args.val_target, is_train=False, scale_factor=args.scale, cache_in_memory=True) if (os.path.exists(args.val_input) and os.path.exists(args.val_target)) else None
+    val_ds = PairedSemiconDataset(args.val_input, args.val_target, is_train=False, scale_factor=args.scale, cache_in_memory=cache_in_memory) if (os.path.exists(args.val_input) and os.path.exists(args.val_target)) else None
     if val_ds and len(val_ds) == 0:
         val_ds = None
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=(device.type == "cuda")) if val_ds else None
 
     # Model Architecture with Bicubic Skip
-    raw_model = NAFNetSR(in_channels=1, out_channels=1, width=64, scale_factor=args.scale).to(device)
+    model_config = {
+        "in_channels": 1,
+        "out_channels": 1,
+        "width": 64,
+        "enc_blocks": (2, 2, 2),
+        "dec_blocks": (2, 2, 2),
+        "scale_factor": args.scale,
+        "use_noise_gate": False,
+    }
+    raw_model = NAFNetSR(**model_config).to(device)
     ema = ModelEMA(raw_model, decay=args.ema_decay)
 
     if torch.cuda.device_count() > 1:
@@ -185,41 +254,58 @@ def main():
     # Optimizer & LR Scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4, betas=(0.9, 0.99))
 
-    start_epoch = 1
-    if args.resume and os.path.exists(args.resume):
-        print(f"[Metrology Training] Resuming from checkpoint: '{args.resume}'")
-        checkpoint = torch.load(args.resume, map_location=device)
-        sd = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
-        model.load_state_dict(sd, strict=False)
-        if "ema_state_dict" in checkpoint:
-            ema.ema_model.load_state_dict(checkpoint["ema_state_dict"], strict=False)
-        else:
-            ema.ema_model.load_state_dict(sd, strict=False)
-        if "val_psnr" in checkpoint:
-            best_psnr = float(checkpoint["val_psnr"])
-            print(f"[Metrology Training] Loaded previous best Val PSNR: {best_psnr:.2f} dB")
-        if "epoch" in checkpoint:
-            start_epoch = checkpoint["epoch"] + 1
-            print(f"[Metrology Training] Resuming from epoch {start_epoch}")
-
     # Warmup + Cosine Annealing Scheduler
     def lr_lambda(epoch):
-        if epoch < args.warmup_epochs:
-            return float(epoch + 1) / float(max(1, args.warmup_epochs))
-        else:
-            progress = float(epoch - args.warmup_epochs) / float(max(1, args.epochs - args.warmup_epochs))
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        return warmup_cosine_factor(epoch, args.warmup_epochs, args.epochs)
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+    start_epoch = 1
+    best_psnr = 0.0
+    if args.resume:
+        if not os.path.exists(args.resume):
+            raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
+        print(f"[Metrology Training] Resuming from checkpoint: '{args.resume}'")
+        checkpoint = torch.load(args.resume, map_location=device)
+        checkpoint_model_config = checkpoint.get("model_config") if isinstance(checkpoint, dict) else None
+        if checkpoint_model_config and checkpoint_model_config != model_config:
+            raise ValueError(f"Resume checkpoint model config {checkpoint_model_config} does not match requested config {model_config}")
+        sd = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+        load_model_state_strict(raw_model, sd)
+        load_model_state_strict(ema.ema_model, checkpoint.get("ema_state_dict", sd))
+
+        if "optimizer" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        if "scheduler" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler"])
+        if "scaler" in checkpoint:
+            scaler.load_state_dict(checkpoint["scaler"])
+        if "best_psnr" in checkpoint or "val_psnr" in checkpoint:
+            best_psnr = float(checkpoint.get("best_psnr", checkpoint.get("val_psnr", 0.0)))
+            print(f"[Metrology Training] Loaded previous best Val PSNR: {best_psnr:.2f} dB")
+        if "epoch" in checkpoint:
+            start_epoch = int(checkpoint["epoch"]) + 1
+            print(f"[Metrology Training] Resuming from epoch {start_epoch}")
+
+        # Align the next epoch's LR with the requested schedule. Recomputing it
+        # also allows a completed checkpoint to be extended with a larger --epochs.
+        if start_epoch > 1:
+            scheduler.last_epoch = start_epoch - 1
+            resume_factor = lr_lambda(start_epoch - 1)
+            resume_lrs = [base_lr * resume_factor for base_lr in scheduler.base_lrs]
+            for param_group, resumed_lr in zip(optimizer.param_groups, resume_lrs):
+                param_group["lr"] = resumed_lr
+            scheduler._last_lr = resume_lrs
+            print(f"[Metrology Training] Resumed learning rate: {resume_lrs[0]:.6f}")
 
     # Loss Function (Calibrated Composite Metrology Loss with empirical blur-free weighting)
     criterion = MetrologyLoss(w_charb=1.0, w_edge=0.05, w_fft=0.05, w_ssim=0.2).to(device)
 
-    best_psnr = best_psnr if 'best_psnr' in locals() else 0.0
     print(f"[Metrology Training] Training {len(train_ds)} samples for {args.epochs} epochs (Batch Size: {args.batch_size})...")
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
+        epoch_lr = optimizer.param_groups[0]["lr"]
         running_loss = 0.0
         running_parts = {"charb": 0.0, "edge": 0.0, "fft": 0.0, "ssim": 0.0}
 
@@ -250,15 +336,16 @@ def main():
         avg_loss = running_loss / num_batches
         avg_parts = {k: v / num_batches for k, v in running_parts.items()}
 
-        # Validation phase (evaluate on both Model and EMA model directly on GPU)
+        # Validation phase using the same per-image metrics as eval.py.
         val_psnr, val_ssim = 0.0, 0.0
         val_psnr_ema, val_ssim_ema = 0.0, 0.0
+        val_bicubic_psnr = 0.0
 
         if val_loader:
             model.eval()
             ema.ema_model.eval()
-            val_psnrs, val_ssims = [], []
-            val_psnrs_ema, val_ssims_ema = [], []
+            metric_sums = {"psnr": 0.0, "ssim": 0.0, "psnr_ema": 0.0, "ssim_ema": 0.0, "bicubic_psnr": 0.0}
+            val_sample_count = 0
 
             with torch.no_grad():
                 for inp, tgt, _ in val_loader:
@@ -269,24 +356,35 @@ def main():
                         pred = model(inp)
                         pred_ema = ema.ema_model(inp)
 
-                    p, s = fast_val_metrics_gpu(pred, tgt)
-                    p_ema, s_ema = fast_val_metrics_gpu(pred_ema, tgt)
-                    val_psnrs.append(p)
-                    val_ssims.append(s)
-                    val_psnrs_ema.append(p_ema)
-                    val_ssims_ema.append(s_ema)
+                    bicubic = F.interpolate(inp.float(), scale_factor=args.scale, mode="bicubic", align_corners=False).clamp(0.0, 1.0)
+                    p, s = evaluate_metrics(pred.float(), tgt)
+                    p_ema, s_ema = evaluate_metrics(pred_ema.float(), tgt)
+                    p_bicubic, _ = evaluate_metrics(bicubic, tgt)
+                    batch_count = inp.shape[0]
+                    metric_sums["psnr"] += p * batch_count
+                    metric_sums["ssim"] += s * batch_count
+                    metric_sums["psnr_ema"] += p_ema * batch_count
+                    metric_sums["ssim_ema"] += s_ema * batch_count
+                    metric_sums["bicubic_psnr"] += p_bicubic * batch_count
+                    val_sample_count += batch_count
 
-            val_psnr = sum(val_psnrs) / len(val_psnrs)
-            val_ssim = sum(val_ssims) / len(val_ssims)
-            val_psnr_ema = sum(val_psnrs_ema) / len(val_psnrs_ema)
-            val_ssim_ema = sum(val_ssims_ema) / len(val_ssims_ema)
+            val_psnr = metric_sums["psnr"] / val_sample_count
+            val_ssim = metric_sums["ssim"] / val_sample_count
+            val_psnr_ema = metric_sums["psnr_ema"] / val_sample_count
+            val_ssim_ema = metric_sums["ssim_ema"] / val_sample_count
+            val_bicubic_psnr = metric_sums["bicubic_psnr"] / val_sample_count
 
-        cur_lr = scheduler.get_last_lr()[0]
-        eff_ema = relative_ceiling_efficiency(val_psnr_ema, 38.72, 20.14)
-        print(f"Epoch [{epoch:03d}/{args.epochs:03d}] (LR: {cur_lr:.6f}) - Loss: {avg_loss:.4f} [C:{avg_parts['charb']:.3f}|E:{avg_parts['edge']:.3f}|F:{avg_parts['fft']:.3f}|S:{avg_parts['ssim']:.3f}] | Val PSNR: {val_psnr:.2f}dB (EMA: {val_psnr_ema:.2f}dB, {eff_ema:.1f}% ceiling) | Val SSIM: {val_ssim:.4f} (EMA: {val_ssim_ema:.4f})")
+        eff_ema = relative_ceiling_efficiency(val_psnr_ema, 38.72, val_bicubic_psnr) if val_loader else 0.0
+        print(f"Epoch [{epoch:03d}/{args.epochs:03d}] (LR: {epoch_lr:.6f}) - Loss: {avg_loss:.4f} [C:{avg_parts['charb']:.3f}|E:{avg_parts['edge']:.3f}|F:{avg_parts['fft']:.3f}|S:{avg_parts['ssim']:.3f}] | Val PSNR: {val_psnr:.2f}dB (EMA: {val_psnr_ema:.2f}dB, Bicubic: {val_bicubic_psnr:.2f}dB, {eff_ema:.1f}% estimated gain) | Val SSIM: {val_ssim:.4f} (EMA: {val_ssim_ema:.4f})")
 
         raw_m = model.module if hasattr(model, "module") else model
         model_sd = raw_m.state_dict()
+
+        # Select higher of model or EMA for best checkpoint.
+        best_val = max(val_psnr, val_psnr_ema)
+        selected_ema = val_psnr_ema >= val_psnr
+        best_weights = ema.ema_model.state_dict() if selected_ema else model_sd
+        best_ssim = val_ssim_ema if selected_ema else val_ssim
 
         # Save Latest Checkpoint
         save_path = os.path.join(args.save_dir, "latest_model.pt")
@@ -294,12 +392,15 @@ def main():
             "epoch": epoch,
             "state_dict": model_sd,
             "ema_state_dict": ema.ema_model.state_dict(),
-            "optimizer": optimizer.state_dict()
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "scaler": scaler.state_dict(),
+            "best_psnr": max(best_psnr, best_val),
+            "val_psnr": max(val_psnr, val_psnr_ema),
+            "val_ssim": val_ssim_ema if val_psnr_ema >= val_psnr else val_ssim,
+            "config": vars(args),
+            "model_config": model_config
         }, save_path)
-
-        # Select higher of model or EMA for best checkpoint
-        best_val = max(val_psnr, val_psnr_ema)
-        best_weights = ema.ema_model.state_dict() if val_psnr_ema >= val_psnr else model_sd
 
         if best_val > best_psnr:
             best_psnr = best_val
@@ -307,15 +408,11 @@ def main():
                 "epoch": epoch,
                 "state_dict": best_weights,
                 "val_psnr": best_psnr,
-                "val_ssim": max(val_ssim, val_ssim_ema)
+                "val_ssim": best_ssim,
+                "config": vars(args),
+                "model_config": model_config,
+                "selected_weights": "ema" if selected_ema else "model"
             }, os.path.join(args.save_dir, "best_model.pt"))
-            # Also save to root best_model.pt for easy access
-            torch.save({
-                "epoch": epoch,
-                "state_dict": best_weights,
-                "val_psnr": best_psnr,
-                "val_ssim": max(val_ssim, val_ssim_ema)
-            }, "best_model.pt")
             print(f"  [+] Saved new best model checkpoint! Val PSNR: {best_psnr:.2f} dB")
 
     print(f"\n[Metrology Training] Training Complete! Best Validation PSNR: {best_psnr:.2f} dB")

@@ -1,6 +1,7 @@
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import argparse
 import glob
 import numpy as np
 import cv2
@@ -8,30 +9,47 @@ import torch
 from models.nafnet import NAFNetSR
 from utils.metrics import compute_psnr, compute_ssim
 
-def run_generalization_benchmarks(weights_path="weights/best_model.pt", num_samples=50):
+
+def _load_model_state_strict(model, state_dict):
+    if state_dict and all(key.startswith("module.") for key in state_dict):
+        state_dict = {key[len("module."):]: value for key, value in state_dict.items()}
+    model.load_state_dict(state_dict, strict=True)
+
+
+def run_synthetic_noise_benchmarks(weights_path="weights/best_model.pt", num_samples=50, seed=42):
+    """Measure seeded synthetic Gaussian-noise robustness on known validation content.
+
+    This is not a cross-dataset generalization test: the clean source images come
+    from the project's own train/validation distribution.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = NAFNetSR(in_channels=1, out_channels=1, width=64, scale_factor=2).to(device)
-    
-    if os.path.exists(weights_path):
-        ckpt = torch.load(weights_path, map_location=device)
-        sd = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
-        model.load_state_dict(sd, strict=False)
+
+    if not os.path.exists(weights_path):
+        raise FileNotFoundError(f"Checkpoint not found: {weights_path}")
+    ckpt = torch.load(weights_path, map_location=device)
+    sd = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+    _load_model_state_strict(model, sd)
     model.eval()
+
+    rng = np.random.default_rng(seed)
 
     gt_files = sorted(glob.glob("data/val/GT/*.*"))[:num_samples]
     if not gt_files:
         gt_files = sorted(glob.glob("data/train/GT/*.*"))[:num_samples]
+    if not gt_files:
+        raise FileNotFoundError("No validation or training GT images were found.")
 
     results = {}
     noise_regimes = [
         ("Low Noise (sigma=0.01)", 0.01),
         ("Standard Inspection (sigma=0.03)", 0.03),
-        ("High Shot Noise (sigma=0.05)", 0.05),
-        ("Extreme OOD Noise (sigma=0.08)", 0.08),
+        ("High Noise (sigma=0.05)", 0.05),
+        ("Extreme Noise (sigma=0.08)", 0.08),
     ]
 
     print("=" * 80)
-    print("      CROSS-DATASET & OUT-OF-DISTRIBUTION (OOD) GENERALIZATION AUDIT")
+    print("      SEEDED SYNTHETIC GAUSSIAN-NOISE ROBUSTNESS AUDIT")
     print("=" * 80)
 
     for regime_name, sigma in noise_regimes:
@@ -42,9 +60,9 @@ def run_generalization_benchmarks(weights_path="weights/best_model.pt", num_samp
                 gt = np.clip(gt, 0.0, 1.0)
                 h, w = gt.shape
                 
-                # Physical 2x Area downsampling + synthetic Poisson-Gaussian noise
+                # Working 2x area downsampling + seeded synthetic Gaussian noise.
                 down = cv2.resize(gt, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
-                noisy_lr = np.clip(down + np.random.normal(0, sigma, down.shape).astype(np.float32), 0.0, 1.0)
+                noisy_lr = np.clip(down + rng.normal(0, sigma, down.shape).astype(np.float32), 0.0, 1.0)
                 
                 inp_t = torch.from_numpy(noisy_lr).unsqueeze(0).unsqueeze(0).float().to(device)
                 pred_t = model(inp_t)
@@ -59,5 +77,15 @@ def run_generalization_benchmarks(weights_path="weights/best_model.pt", num_samp
 
     return results
 
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Seeded synthetic noise robustness benchmark")
+    parser.add_argument("--weights", default="weights/best_model.pt")
+    parser.add_argument("--num_samples", type=int, default=50)
+    parser.add_argument("--seed", type=int, default=42)
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    run_generalization_benchmarks()
+    cli_args = parse_args()
+    run_synthetic_noise_benchmarks(cli_args.weights, cli_args.num_samples, cli_args.seed)

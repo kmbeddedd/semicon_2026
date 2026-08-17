@@ -67,12 +67,17 @@ class PairedSemiconDataset(Dataset):
             img = np.load(path).astype(np.float32)
             if img.ndim == 3:
                 img = img.squeeze()
-            return img
         else:
             img_raw = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
             if img_raw is None:
                 raise FileNotFoundError(f"Failed to read image: {path}")
-            return img_raw.astype(np.float32) / 255.0
+            img = img_raw.astype(np.float32) / 255.0
+
+        if img.ndim != 2:
+            raise ValueError(f"Expected a single-channel 2D image at '{path}', got shape {img.shape}")
+        if not np.isfinite(img).all():
+            raise ValueError(f"Image contains NaN or infinite values: '{path}'")
+        return img
 
     def _apply_augmentations(self, inp: np.ndarray, tgt: np.ndarray):
         # 1. Random 90-degree rotations & Dihedral Flips
@@ -130,6 +135,13 @@ class PairedSemiconDataset(Dataset):
 
         if self.is_train and self.target_paths:
             inp_img, tgt_img = self._apply_augmentations(inp_img, tgt_img)
+
+        expected_target_shape = (inp_img.shape[0] * self.scale_factor, inp_img.shape[1] * self.scale_factor)
+        if self.target_paths and tgt_img.shape != expected_target_shape:
+            raise ValueError(
+                f"Pair shape mismatch for '{os.path.basename(inp_path)}': input {inp_img.shape}, "
+                f"target {tgt_img.shape}, expected target {expected_target_shape} for scale={self.scale_factor}"
+            )
 
         # Optional random patch crop during training (if patch_size > 0 and < image size)
         if self.is_train and self.patch_size > 0:
