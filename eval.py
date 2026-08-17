@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from models.nafnet import NAFNetSR
+from models.nafnet import NAFNetSR, resolve_nafnet_config
 from utils.dataset import robust_percentile_normalize
 from utils.metrics import compute_psnr, compute_ssim, wavelet_noise_sigma, psnr_ceiling, relative_ceiling_efficiency
 
@@ -109,23 +109,23 @@ def main():
     use_jit = (not args.no_jit)
     use_tta = not args.no_tta
 
-    # Load Base PyTorch Model
-    base_model = NAFNetSR(in_channels=1, out_channels=1, width=64, scale_factor=args.scale).to(device)
-
     weights_path = args.weights
     if not os.path.exists(weights_path) and os.path.exists("best_model.pt"):
         weights_path = "best_model.pt"
 
-    if os.path.exists(weights_path):
-        print(f"[Metrology Eval] Loading checkpoint: {weights_path}")
-        checkpoint = torch.load(weights_path, map_location=device)
-        state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
-        checkpoint_scale = checkpoint.get("config", {}).get("scale") if isinstance(checkpoint, dict) else None
-        if checkpoint_scale is not None and int(checkpoint_scale) != args.scale:
-            raise ValueError(f"Checkpoint was trained for scale={checkpoint_scale}, but --scale={args.scale} was requested.")
-        load_model_state_strict(base_model, state_dict)
-    else:
+    if not os.path.exists(weights_path):
         raise FileNotFoundError(f"Weights file not found: {weights_path}")
+
+    print(f"[Metrology Eval] Loading checkpoint: {weights_path}")
+    checkpoint = torch.load(weights_path, map_location=device)
+    state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+    model_config = resolve_nafnet_config(checkpoint, scale_factor=args.scale)
+    checkpoint_scale = model_config["scale_factor"]
+    if int(checkpoint_scale) != args.scale:
+        raise ValueError(f"Checkpoint was trained for scale={checkpoint_scale}, but --scale={args.scale} was requested.")
+
+    base_model = NAFNetSR(**model_config).to(device)
+    load_model_state_strict(base_model, state_dict)
 
     base_model.eval()
 

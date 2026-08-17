@@ -18,7 +18,7 @@ from utils.signal_analysis import (
     relative_ceiling_efficiency
 )
 from utils.metrics import compute_psnr, compute_ssim
-from models.nafnet import NAFNetSR
+from models.nafnet import NAFNetSR, resolve_nafnet_config
 
 
 def load_model_state_strict(model: torch.nn.Module, state_dict):
@@ -193,8 +193,8 @@ def main():
     if os.path.exists(weights_file):
         print(f"\n[4] CLEAN-INPUT DEGRADATION AUDIT (Does unconditional denoising damage clean inputs?)")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = NAFNetSR(in_channels=1, out_channels=1, width=64, scale_factor=2).to(device)
         ckpt = torch.load(weights_file, map_location=device)
+        model = NAFNetSR(**resolve_nafnet_config(ckpt, scale_factor=2)).to(device)
         sd = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
         load_model_state_strict(model, sd)
         model.eval()

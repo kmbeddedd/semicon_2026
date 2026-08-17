@@ -95,6 +95,16 @@ The checkpoint was tested with seeded additive Gaussian noise applied to area-do
 
 The current model uses a bicubic residual skip, zero-initialized SR head, EMA weights, and a Charbonnier/Sobel/FFT/two-scale SSIM loss. These choices are visible and reproducible in code. Historical leave-one-out numbers are not presented as verified ablations because the repository does not contain the corresponding checkpoints, logs, or experiment configurations. The optional NoiseGate and VST utilities are experimental and are **not** represented in `weights/best_model.pt`.
 
+### Research-derived accuracy extension
+
+The optional transfer-learning path adapts two ideas from recent sequence-modeling research without introducing recurrent or diffusion components that are inappropriate for deterministic image metrology:
+
+* `--spectral_mixer` adds an identity-initialized, gated **2D local-convolution/FFT mixer** at the bottleneck. Its zero-initialized projection makes the extended model exactly equal to the transferred checkpoint before fine-tuning.
+* `--uncertainty_head` adds per-pixel heteroscedastic variance prediction supervised with **beta-NLL**. The detached variance weighting limits variance inflation; inference still returns only the deterministic restored image.
+* `--init_weights weights/best_model.pt` safely transfers the verified backbone while allowing only the explicitly enabled extension tensors to be new. The base and extension learning rates can be separated with `--extension_lr_multiplier`.
+
+The bundled `weights/best_model.pt` remains the verified 28.71 dB baseline. The research extension must exceed that score during full validation before `best_model.pt` is replaced.
+
 ---
 
 ## 🔬 Core Architecture & Pipeline
@@ -232,6 +242,8 @@ python utils/generalization.py --weights weights/best_model.pt --num_samples 50 
 ### Option A: 1-Click Cloud Training on Google Colab (Single T4 GPU)
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kmbeddedd/semicon_2026/blob/Kunal/train_colab.ipynb)
 
+The Colab notebook now runs the research extension as a resumable Google Drive experiment. It preserves the accepted baseline, restores complete training state from `latest_model.pt`, and writes checkpoints atomically.
+
 ### Option B: Distributed Cloud Training on Kaggle (Dual Tesla T4 x2 GPUs)
 Use the included [`train_kaggle.ipynb`](train_kaggle.ipynb) notebook on Kaggle with Accelerator set to **GPU T4 x2**:
 * Uses **PyTorch `DataParallel`** to split mini-batches (`batch_size=64`, 32 per GPU).
@@ -240,6 +252,9 @@ Use the included [`train_kaggle.ipynb`](train_kaggle.ipynb) notebook on Kaggle w
 ### Option C: Local Training
 ```bash
 python train.py --train_input data/train/NoisyLR --train_target data/train/GT --val_input data/val/NoisyLR --val_target data/val/GT --epochs 100 --batch_size 16 --lr 5e-4 --scale 2
+
+# Research fine-tune from the verified checkpoint
+python train.py --init_weights weights/best_model.pt --spectral_mixer --uncertainty_head --w_nll 0.02 --nll_beta 0.5 --extension_lr_multiplier 5 --epochs 20 --warmup_epochs 1 --batch_size 16 --lr 2e-5 --scale 2
 ```
 
 Training is seeded by default (`--seed 42`). Use `--deterministic` for deterministic kernels, `--no_cache` on memory-constrained systems, and `--resume weights/latest_model.pt` to restore model, EMA, optimizer, scheduler, and AMP scaler state. Checkpoint loading is strict and rejects incompatible architectures.
@@ -259,7 +274,7 @@ semicon_2026/
 ├── train_colab.ipynb         # 1-Click Google Colab training notebook
 ├── models/
 │   ├── __init__.py
-│   └── nafnet.py             # NAFNet-SR with residual skip and experimental optional NoiseGate
+│   └── nafnet.py             # NAFNet-SR, optional dual-domain mixer & uncertainty head
 ├── utils/
 │   ├── dataset.py            # Calibrated dataset loader & metrology augmentations
 │   ├── signal_analysis.py    # Wavelet-MAD, Arcsinh VST, blur sweep & kernel tests
@@ -279,7 +294,7 @@ semicon_2026/
 
 ### Reproducibility and storage notes
 
-* The shipped checkpoint reproduces the table above, but a full retraining run has not yet been executed after the training-engine hardening changes.
+* The shipped checkpoint reproduces the table above. The new research extension has passed transfer, FP16, TorchScript, loss-gradient, and checkpoint smoke tests; its full Colab fine-tune remains an experiment until it beats the baseline on all 320 validation pairs.
 * Dataset ZIPs use Git LFS, but the repository contains both full and partitioned archives (about 1.79 GiB when checked out). Removing that duplication or moving it to release/DVC storage requires a separate artifact migration.
 * Exact historical ablation results require experiment-specific checkpoints and logs; they are intentionally not claimed by the current reproducible benchmark.
 

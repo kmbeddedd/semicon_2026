@@ -6,7 +6,7 @@ import glob
 import numpy as np
 import cv2
 import torch
-from models.nafnet import NAFNetSR
+from models.nafnet import NAFNetSR, resolve_nafnet_config
 from utils.metrics import compute_psnr, compute_ssim
 
 
@@ -23,11 +23,10 @@ def run_synthetic_noise_benchmarks(weights_path="weights/best_model.pt", num_sam
     from the project's own train/validation distribution.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = NAFNetSR(in_channels=1, out_channels=1, width=64, scale_factor=2).to(device)
-
     if not os.path.exists(weights_path):
         raise FileNotFoundError(f"Checkpoint not found: {weights_path}")
     ckpt = torch.load(weights_path, map_location=device)
+    model = NAFNetSR(**resolve_nafnet_config(ckpt, scale_factor=2)).to(device)
     sd = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
     _load_model_state_strict(model, sd)
     model.eval()

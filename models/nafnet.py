@@ -81,6 +81,56 @@ class NAFBlock(nn.Module):
         x = self.dropout2(x)
         return y + x * self.gamma
 
+
+class DualDomainMixer(nn.Module):
+    """Gated local/spectral feature mixer with an identity-safe output projection.
+
+    This adapts the supplied research note's FFT/convolution dual-path idea from
+    1D telemetry to 2D image features. The final projection is zero-initialized,
+    so enabling the block preserves a transferred base model exactly at step 0.
+    """
+    def __init__(self, channels):
+        super().__init__()
+        self.channels = channels
+        self.norm = LayerNorm2d(channels)
+        self.local = nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels)
+        self.spectral_mix = nn.Conv2d(2 * channels, 2 * channels, kernel_size=1, groups=channels)
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.project = nn.Conv2d(channels, channels, kernel_size=1)
+        nn.init.zeros_(self.project.weight)
+        nn.init.zeros_(self.project.bias)
+
+    def forward(self, x):
+        z = self.norm(x)
+        local_features = self.local(z)
+
+        # FFT kernels run in FP32. Explicit functional convolution keeps this
+        # valid after eval.py converts the surrounding model to FP16.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            z_f32 = z.float()
+            spectrum = torch.fft.rfft2(z_f32, norm="ortho")
+            batch, channels, height, freq_width = spectrum.shape
+            spectral_pairs = torch.stack((spectrum.real, spectrum.imag), dim=2)
+            spectral_pairs = spectral_pairs.reshape(batch, 2 * channels, height, freq_width)
+            mixed_pairs = F.conv2d(
+                spectral_pairs,
+                self.spectral_mix.weight.float(),
+                self.spectral_mix.bias.float() if self.spectral_mix.bias is not None else None,
+                groups=self.channels,
+            )
+            mixed_pairs = mixed_pairs.reshape(batch, channels, 2, height, freq_width)
+            mixed_spectrum = torch.complex(mixed_pairs[:, :, 0], mixed_pairs[:, :, 1])
+            spectral_features = torch.fft.irfft2(mixed_spectrum, s=z_f32.shape[-2:], norm="ortho")
+
+        spectral_features = spectral_features.to(local_features.dtype)
+        frequency_gate = self.gate(z)
+        mixed_features = frequency_gate * spectral_features + (1.0 - frequency_gate) * local_features
+        return x + self.project(mixed_features)
+
 class NoiseGate(nn.Module):
     """
     Learned Dynamic Noise Gate to prevent clean input damage.
@@ -109,7 +159,18 @@ class NAFNetSR(nn.Module):
     Supports experimental optional NoiseGate conditioning and a zero-initialized residual head.
     The bundled checkpoint was trained without NoiseGate conditioning.
     """
-    def __init__(self, in_channels=1, out_channels=1, width=64, enc_blocks=(2, 2, 2), dec_blocks=(2, 2, 2), scale_factor=2, use_noise_gate=False):
+    def __init__(
+        self,
+        in_channels=1,
+        out_channels=1,
+        width=64,
+        enc_blocks=(2, 2, 2),
+        dec_blocks=(2, 2, 2),
+        scale_factor=2,
+        use_noise_gate=False,
+        use_spectral_mixer=False,
+        predict_uncertainty=False,
+    ):
         super().__init__()
         if len(enc_blocks) != len(dec_blocks):
             raise ValueError("enc_blocks and dec_blocks must contain the same number of stages")
@@ -118,6 +179,8 @@ class NAFNetSR(nn.Module):
         scale_factor = int(scale_factor)
         self.scale_factor = scale_factor
         self.use_noise_gate = use_noise_gate
+        self.use_spectral_mixer = use_spectral_mixer
+        self.predict_uncertainty = predict_uncertainty
         self.intro = nn.Conv2d(in_channels, width, kernel_size=3, padding=1)
 
         self.encoders = nn.ModuleList()
@@ -132,6 +195,7 @@ class NAFNetSR(nn.Module):
             curr_width *= 2
 
         self.middle_blks = nn.Sequential(*[NAFBlock(curr_width) for _ in range(3)])
+        self.spectral_mixer = DualDomainMixer(curr_width) if use_spectral_mixer else None
 
         for num in dec_blocks:
             self.ups.append(nn.Sequential(
@@ -163,7 +227,22 @@ class NAFNetSR(nn.Module):
         else:
             self.noise_gate = None
 
-    def forward(self, inp, noise_stats=None):
+        if predict_uncertainty:
+            if scale_factor > 1:
+                self.uncertainty_head = nn.Sequential(
+                    nn.Conv2d(width, width * (scale_factor ** 2), kernel_size=3, padding=1),
+                    nn.PixelShuffle(scale_factor),
+                    nn.Conv2d(width, out_channels, kernel_size=3, padding=1),
+                )
+            else:
+                self.uncertainty_head = nn.Conv2d(width, out_channels, kernel_size=3, padding=1)
+            nn.init.zeros_(self.uncertainty_head[-1].weight if isinstance(self.uncertainty_head, nn.Sequential) else self.uncertainty_head.weight)
+            uncertainty_bias = self.uncertainty_head[-1].bias if isinstance(self.uncertainty_head, nn.Sequential) else self.uncertainty_head.bias
+            nn.init.constant_(uncertainty_bias, -6.0)
+        else:
+            self.uncertainty_head = None
+
+    def forward(self, inp, noise_stats=None, return_uncertainty=False):
         # Extract primary intensity channel for bicubic base (cleanly JIT trace compatible)
         raw_inp = inp[:, :1, :, :]
         x = self.intro(inp)
@@ -175,6 +254,8 @@ class NAFNetSR(nn.Module):
             x = down(x)
 
         x = self.middle_blks(x)
+        if self.spectral_mixer is not None:
+            x = self.spectral_mixer(x)
 
         for decoder, up, skip in zip(self.decoders, self.ups, reversed(skips)):
             x = up(x)
@@ -204,4 +285,31 @@ class NAFNetSR(nn.Module):
 
         # Preserve gradients for out-of-range training predictions; inference is
         # clamped to the physical image range.
-        return out if self.training else torch.clamp(out, 0.0, 1.0)
+        out = out if self.training else torch.clamp(out, 0.0, 1.0)
+
+        if return_uncertainty:
+            if self.uncertainty_head is None:
+                raise ValueError("return_uncertainty=True requires predict_uncertainty=True")
+            raw_variance = self.uncertainty_head(x)
+            return out, raw_variance
+        return out
+
+
+def resolve_nafnet_config(checkpoint=None, scale_factor=2):
+    """Resolve a validated model config from legacy or self-describing checkpoints."""
+    default_config = {
+        "in_channels": 1,
+        "out_channels": 1,
+        "width": 64,
+        "enc_blocks": (2, 2, 2),
+        "dec_blocks": (2, 2, 2),
+        "scale_factor": scale_factor,
+        "use_noise_gate": False,
+        "use_spectral_mixer": False,
+        "predict_uncertainty": False,
+    }
+    checkpoint_config = checkpoint.get("model_config", {}) if isinstance(checkpoint, dict) else {}
+    unknown_keys = set(checkpoint_config) - set(default_config)
+    if unknown_keys:
+        raise ValueError(f"Checkpoint contains unsupported model config keys: {sorted(unknown_keys)}")
+    return {**default_config, **checkpoint_config}

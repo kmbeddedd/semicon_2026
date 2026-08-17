@@ -53,6 +53,30 @@ def load_model_state_strict(model: torch.nn.Module, state_dict):
     model.load_state_dict(state_dict, strict=True)
 
 
+def load_model_state_for_extension(model: torch.nn.Module, state_dict, allowed_missing_prefixes):
+    """Transfer base weights while allowing only explicitly new module keys."""
+    if state_dict and all(key.startswith("module.") for key in state_dict):
+        state_dict = {key[len("module."):]: value for key, value in state_dict.items()}
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    invalid_missing = [
+        key for key in incompatible.missing_keys
+        if not any(key.startswith(prefix) for prefix in allowed_missing_prefixes)
+    ]
+    if invalid_missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            f"Unsafe transfer checkpoint mismatch; missing={invalid_missing}, "
+            f"unexpected={incompatible.unexpected_keys}"
+        )
+    return incompatible.missing_keys
+
+
+def atomic_torch_save(payload, path):
+    """Write a checkpoint beside its destination and atomically replace it."""
+    temp_path = f"{path}.tmp"
+    torch.save(payload, temp_path)
+    os.replace(temp_path, path)
+
+
 def ensure_validation_split(args):
     """Create a deterministic, non-overlapping paired validation split when needed."""
     valid_exts = ('*.npy', '*.NPY', '*.png', '*.PNG', '*.jpg', '*.JPG', '*.jpeg', '*.JPEG', '*.tif', '*.TIF')
@@ -129,6 +153,12 @@ def parse_args():
     parser.add_argument("--no_amp", action="store_true", help="Disable Automatic Mixed Precision (AMP)")
     parser.add_argument("--ema_decay", type=float, default=0.999, help="Exponential moving average decay factor")
     parser.add_argument("--resume", type=str, default="", help="Optional path to checkpoint (.pt) to resume training from")
+    parser.add_argument("--init_weights", type=str, default="", help="Initialize an extended architecture from compatible base weights")
+    parser.add_argument("--spectral_mixer", action="store_true", help="Enable the identity-initialized local/FFT bottleneck mixer")
+    parser.add_argument("--uncertainty_head", action="store_true", help="Train a heteroscedastic uncertainty head with beta-NLL")
+    parser.add_argument("--w_nll", type=float, default=0.05, help="Beta-NLL auxiliary loss weight when --uncertainty_head is enabled")
+    parser.add_argument("--nll_beta", type=float, default=0.5, help="Detached variance weighting exponent for beta-NLL")
+    parser.add_argument("--extension_lr_multiplier", type=float, default=1.0, help="LR multiplier for spectral/uncertainty modules during transfer training")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducible training")
     parser.add_argument("--deterministic", action="store_true", help="Prefer deterministic kernels over maximum throughput")
     return parser.parse_args()
@@ -189,6 +219,12 @@ def auto_detect_dataset_paths(args):
 
 def main():
     args = parse_args()
+    if args.resume and args.init_weights:
+        raise ValueError("Use either --resume or --init_weights, not both")
+    if args.w_nll < 0:
+        raise ValueError("--w_nll must be non-negative")
+    if args.extension_lr_multiplier <= 0:
+        raise ValueError("--extension_lr_multiplier must be positive")
     seed_everything(args.seed, deterministic=args.deterministic)
     args = auto_detect_dataset_paths(args)
     os.makedirs(args.save_dir, exist_ok=True)
@@ -241,8 +277,27 @@ def main():
         "dec_blocks": (2, 2, 2),
         "scale_factor": args.scale,
         "use_noise_gate": False,
+        "use_spectral_mixer": args.spectral_mixer,
+        "predict_uncertainty": args.uncertainty_head,
     }
     raw_model = NAFNetSR(**model_config).to(device)
+    initialization_best_psnr = 0.0
+
+    if args.init_weights:
+        if not os.path.exists(args.init_weights):
+            raise FileNotFoundError(f"Initialization checkpoint not found: {args.init_weights}")
+        initialization_checkpoint = torch.load(args.init_weights, map_location=device)
+        initialization_state = initialization_checkpoint.get("state_dict", initialization_checkpoint)
+        if isinstance(initialization_checkpoint, dict):
+            initialization_best_psnr = float(initialization_checkpoint.get("val_psnr", 0.0))
+        allowed_prefixes = []
+        if args.spectral_mixer:
+            allowed_prefixes.append("spectral_mixer.")
+        if args.uncertainty_head:
+            allowed_prefixes.append("uncertainty_head.")
+        missing_keys = load_model_state_for_extension(raw_model, initialization_state, tuple(allowed_prefixes))
+        print(f"[Metrology Training] Initialized base weights from '{args.init_weights}' ({len(missing_keys)} new tensors).")
+
     ema = ModelEMA(raw_model, decay=args.ema_decay)
 
     if torch.cuda.device_count() > 1:
@@ -252,7 +307,17 @@ def main():
         model = raw_model
 
     # Optimizer & LR Scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4, betas=(0.9, 0.99))
+    extension_params = []
+    if raw_model.spectral_mixer is not None:
+        extension_params.extend(raw_model.spectral_mixer.parameters())
+    if raw_model.uncertainty_head is not None:
+        extension_params.extend(raw_model.uncertainty_head.parameters())
+    extension_param_ids = {id(param) for param in extension_params}
+    base_params = [param for param in raw_model.parameters() if id(param) not in extension_param_ids]
+    optimizer_groups = [{"params": base_params, "lr": args.lr}]
+    if extension_params:
+        optimizer_groups.append({"params": extension_params, "lr": args.lr * args.extension_lr_multiplier})
+    optimizer = torch.optim.AdamW(optimizer_groups, lr=args.lr, weight_decay=1e-4, betas=(0.9, 0.99))
 
     # Warmup + Cosine Annealing Scheduler
     def lr_lambda(epoch):
@@ -261,7 +326,7 @@ def main():
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     start_epoch = 1
-    best_psnr = 0.0
+    best_psnr = initialization_best_psnr
     if args.resume:
         if not os.path.exists(args.resume):
             raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
@@ -299,7 +364,14 @@ def main():
             print(f"[Metrology Training] Resumed learning rate: {resume_lrs[0]:.6f}")
 
     # Loss Function (Calibrated Composite Metrology Loss with empirical blur-free weighting)
-    criterion = MetrologyLoss(w_charb=1.0, w_edge=0.05, w_fft=0.05, w_ssim=0.2).to(device)
+    criterion = MetrologyLoss(
+        w_charb=1.0,
+        w_edge=0.05,
+        w_fft=0.05,
+        w_ssim=0.2,
+        w_nll=args.w_nll if args.uncertainty_head else 0.0,
+        nll_beta=args.nll_beta,
+    ).to(device)
 
     print(f"[Metrology Training] Training {len(train_ds)} samples for {args.epochs} epochs (Batch Size: {args.batch_size})...")
 
@@ -307,7 +379,7 @@ def main():
         model.train()
         epoch_lr = optimizer.param_groups[0]["lr"]
         running_loss = 0.0
-        running_parts = {"charb": 0.0, "edge": 0.0, "fft": 0.0, "ssim": 0.0}
+        running_parts = {"charb": 0.0, "edge": 0.0, "fft": 0.0, "ssim": 0.0, "nll": 0.0}
 
         for inp, tgt, _ in train_loader:
             inp = inp.to(device, non_blocking=True)
@@ -315,8 +387,11 @@ def main():
 
             optimizer.zero_grad()
             with (torch.amp.autocast('cuda', enabled=use_amp) if hasattr(torch.amp, "autocast") else torch.cuda.amp.autocast(enabled=use_amp)):
-                pred = model(inp)
-                loss, parts = criterion(pred, tgt)
+                if args.uncertainty_head:
+                    pred, raw_variance = model(inp, return_uncertainty=True)
+                else:
+                    pred, raw_variance = model(inp), None
+                loss, parts = criterion(pred, tgt, raw_variance=raw_variance)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -375,7 +450,7 @@ def main():
             val_bicubic_psnr = metric_sums["bicubic_psnr"] / val_sample_count
 
         eff_ema = relative_ceiling_efficiency(val_psnr_ema, 38.72, val_bicubic_psnr) if val_loader else 0.0
-        print(f"Epoch [{epoch:03d}/{args.epochs:03d}] (LR: {epoch_lr:.6f}) - Loss: {avg_loss:.4f} [C:{avg_parts['charb']:.3f}|E:{avg_parts['edge']:.3f}|F:{avg_parts['fft']:.3f}|S:{avg_parts['ssim']:.3f}] | Val PSNR: {val_psnr:.2f}dB (EMA: {val_psnr_ema:.2f}dB, Bicubic: {val_bicubic_psnr:.2f}dB, {eff_ema:.1f}% estimated gain) | Val SSIM: {val_ssim:.4f} (EMA: {val_ssim_ema:.4f})")
+        print(f"Epoch [{epoch:03d}/{args.epochs:03d}] (LR: {epoch_lr:.6f}) - Loss: {avg_loss:.4f} [C:{avg_parts['charb']:.3f}|E:{avg_parts['edge']:.3f}|F:{avg_parts['fft']:.3f}|S:{avg_parts['ssim']:.3f}|N:{avg_parts['nll']:.3f}] | Val PSNR: {val_psnr:.2f}dB (EMA: {val_psnr_ema:.2f}dB, Bicubic: {val_bicubic_psnr:.2f}dB, {eff_ema:.1f}% estimated gain) | Val SSIM: {val_ssim:.4f} (EMA: {val_ssim_ema:.4f})")
 
         raw_m = model.module if hasattr(model, "module") else model
         model_sd = raw_m.state_dict()
@@ -388,7 +463,7 @@ def main():
 
         # Save Latest Checkpoint
         save_path = os.path.join(args.save_dir, "latest_model.pt")
-        torch.save({
+        atomic_torch_save({
             "epoch": epoch,
             "state_dict": model_sd,
             "ema_state_dict": ema.ema_model.state_dict(),
@@ -404,7 +479,7 @@ def main():
 
         if best_val > best_psnr:
             best_psnr = best_val
-            torch.save({
+            atomic_torch_save({
                 "epoch": epoch,
                 "state_dict": best_weights,
                 "val_psnr": best_psnr,

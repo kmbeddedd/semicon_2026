@@ -14,10 +14,10 @@ from utils.signal_analysis import (
     vst_inverse_torch,
     NoiseGate
 )
-from utils.losses import MetrologyLoss, FFTLoss, SSIMLoss, SobelEdgeLoss, CharbonnierLoss
+from utils.losses import MetrologyLoss, FFTLoss, SSIMLoss, SobelEdgeLoss, CharbonnierLoss, BetaGaussianNLLLoss
 from models.nafnet import NAFNetSR
 from utils.dataset import PairedSemiconDataset
-from train import warmup_cosine_factor, load_model_state_strict, ensure_validation_split
+from train import warmup_cosine_factor, load_model_state_strict, load_model_state_for_extension, atomic_torch_save, ensure_validation_split
 from eval import predict_tta_batched
 
 class TestSignalProcessing(unittest.TestCase):
@@ -90,6 +90,47 @@ class TestSignalProcessing(unittest.TestCase):
         self.assertGreater(train_out.max().item(), 1.0)
         self.assertLessEqual(eval_out.max().item(), 1.0)
 
+    def test_spectral_extension_preserves_transferred_model_at_initialization(self):
+        base = NAFNetSR(width=8, enc_blocks=(1,), dec_blocks=(1,), scale_factor=2).eval()
+        extended = NAFNetSR(
+            width=8,
+            enc_blocks=(1,),
+            dec_blocks=(1,),
+            scale_factor=2,
+            use_spectral_mixer=True,
+        ).eval()
+        missing = load_model_state_for_extension(extended, base.state_dict(), ("spectral_mixer.",))
+        self.assertTrue(missing)
+
+        inp = torch.rand(1, 1, 16, 16)
+        with torch.no_grad():
+            base_out = base(inp)
+            extended_out = extended(inp)
+        self.assertTrue(torch.equal(base_out, extended_out))
+
+    def test_uncertainty_head_and_beta_nll(self):
+        model = NAFNetSR(
+            width=8,
+            enc_blocks=(1,),
+            dec_blocks=(1,),
+            scale_factor=2,
+            predict_uncertainty=True,
+        ).train()
+        inp = torch.rand(2, 1, 16, 16)
+        pred, raw_variance = model(inp, return_uncertainty=True)
+        self.assertEqual(pred.shape, raw_variance.shape)
+
+        target = torch.rand_like(pred)
+        criterion = MetrologyLoss(w_nll=0.05, nll_beta=0.5)
+        loss, parts = criterion(pred, target, raw_variance)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIn("nll", parts)
+        loss.backward()
+        self.assertIsNotNone(model.uncertainty_head[-1].weight.grad)
+
+        with self.assertRaises(ValueError):
+            BetaGaussianNLLLoss(beta=1.5)
+
     def test_scheduler_transition_and_strict_checkpoint_loading(self):
         self.assertAlmostEqual(warmup_cosine_factor(0, 5, 100), 0.2)
         self.assertAlmostEqual(warmup_cosine_factor(4, 5, 100), 1.0)
@@ -156,6 +197,15 @@ class TestSignalProcessing(unittest.TestCase):
             self.assertEqual(len(val_names), 1)
             self.assertFalse(train_names & val_names)
             self.assertEqual(val_names, set(os.listdir(val_target)))
+
+    def test_atomic_checkpoint_save(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            checkpoint_path = os.path.join(tmp_dir, "checkpoint.pt")
+            atomic_torch_save({"epoch": 3, "value": torch.tensor([1.0])}, checkpoint_path)
+            self.assertTrue(os.path.exists(checkpoint_path))
+            self.assertFalse(os.path.exists(f"{checkpoint_path}.tmp"))
+            loaded = torch.load(checkpoint_path, map_location="cpu")
+            self.assertEqual(loaded["epoch"], 3)
 
     def test_tta_identity(self):
         inp = torch.rand(2, 1, 16, 16)

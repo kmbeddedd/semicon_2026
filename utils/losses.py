@@ -98,25 +98,50 @@ class SSIMLoss(nn.Module):
         loss_scale2 = self._ssim_single_scale(p_down, t_down, max(3, self.window_size // 2 * 2 + 1))
         return 0.6 * loss_scale1 + 0.4 * loss_scale2
 
+
+class BetaGaussianNLLLoss(nn.Module):
+    """Variance-stabilized heteroscedastic Gaussian NLL.
+
+    The detached variance weighting follows the beta-NLL idea described in the
+    supplied research note and limits the incentive to inflate uncertainty.
+    """
+    def __init__(self, beta=0.5, eps=1e-6):
+        super().__init__()
+        if not 0.0 <= beta <= 1.0:
+            raise ValueError("beta must be in [0, 1]")
+        self.beta = beta
+        self.eps = eps
+
+    def forward(self, mean, target, raw_variance):
+        mean_f32 = mean.float()
+        target_f32 = target.float()
+        variance = F.softplus(raw_variance.float()) + self.eps
+        nll = 0.5 * (torch.log(variance) + (target_f32 - mean_f32).square() / variance)
+        if self.beta > 0:
+            nll = nll * variance.detach().pow(self.beta)
+        return nll.mean()
+
 class MetrologyLoss(nn.Module):
     """
     Composite Metrology Loss tailored for Semiconductor Inspection Image Restoration.
     Combines Charbonnier (pixel fidelity), calibrated Sobel (boundary roughness),
     Ortho-2D FFT (frequency speckle), and MS-SSIM (structural patterns).
     """
-    def __init__(self, w_charb=1.0, w_edge=0.05, w_fft=0.05, w_ssim=0.2):
+    def __init__(self, w_charb=1.0, w_edge=0.05, w_fft=0.05, w_ssim=0.2, w_nll=0.0, nll_beta=0.5):
         super().__init__()
         self.charbonnier = CharbonnierLoss()
         self.edge = SobelEdgeLoss()
         self.fft = FFTLoss()
         self.ssim = SSIMLoss()
+        self.nll = BetaGaussianNLLLoss(beta=nll_beta)
 
         self.w_charb = w_charb
         self.w_edge = w_edge
         self.w_fft = w_fft
         self.w_ssim = w_ssim
+        self.w_nll = w_nll
 
-    def forward(self, pred, target):
+    def forward(self, pred, target, raw_variance=None):
         # Loss evaluation stays in FP32 even when the model forward pass uses AMP.
         with torch.autocast(device_type=pred.device.type, enabled=False):
             pred_f32 = pred.float()
@@ -125,11 +150,24 @@ class MetrologyLoss(nn.Module):
             l_edge = self.edge(pred_f32, target_f32)
             l_fft = self.fft(pred_f32, target_f32)
             l_ssim = self.ssim(pred_f32, target_f32)
+            if self.w_nll > 0:
+                if raw_variance is None:
+                    raise ValueError("raw_variance is required when w_nll > 0")
+                l_nll = self.nll(pred_f32, target_f32, raw_variance.float())
+            else:
+                l_nll = pred_f32.new_zeros(())
 
-            total = self.w_charb * l_charb + self.w_edge * l_edge + self.w_fft * l_fft + self.w_ssim * l_ssim
+            total = (
+                self.w_charb * l_charb
+                + self.w_edge * l_edge
+                + self.w_fft * l_fft
+                + self.w_ssim * l_ssim
+                + self.w_nll * l_nll
+            )
         return total, {
             "charb": float(l_charb.item()),
             "edge": float(l_edge.item()),
             "fft": float(l_fft.item()),
-            "ssim": float(l_ssim.item())
+            "ssim": float(l_ssim.item()),
+            "nll": float(l_nll.item()),
         }
