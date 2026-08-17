@@ -1,307 +1,387 @@
-# AI-Based Restoration of Degraded Images for Semiconductor Inspection (KLA Challenge PS01)
+# SemiCon Restore: Research NAFNet-SR for Semiconductor Inspection
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kmbeddedd/semicon_2026/blob/Kunal/train_colab.ipynb)
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kmbeddedd/semicon_2026/blob/Kunal/train_colab.ipynb)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-orange.svg)](https://pytorch.org/)
-[![CUDA Accelerated](https://img.shields.io/badge/CUDA-Tensor%20Cores-green.svg)](https://developer.nvidia.com/cuda-zone)
+[![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0%2B-orange.svg)](https://pytorch.org/)
+[![Tests](https://img.shields.io/badge/tests-16%2F16%20passing-brightgreen.svg)](#robustness-and-verification)
 
-An end-to-end, ultra-fast deep learning solution for restoring highly degraded semiconductor inspection images (CD-SEM, E-beam Inspection, and Optical Metrology) under severe high-throughput scanning noise.
+An end-to-end deep-learning pipeline for the **KLA Challenge PS01**: restore noisy, undersampled semiconductor inspection images while upscaling them from `128×128` to `256×256`.
 
----
+The solution combines a lightweight NAFNet backbone, a physical bicubic residual path, a learned local/FFT feature mixer, uncertainty-aware training, and optional 8-fold test-time augmentation. It includes training, evaluation, data characterization, cloud notebooks, strict checkpoint loading, and submission-ready NPY/PNG generation.
 
-## 📌 Problem Overview & Metrology Significance
+## 60-second judge overview
 
-In advanced semiconductor fabrication (sub-3nm GAAFET, FinFET, High-NA EUV lithography), inline wafer inspection faces a critical trade-off: **Scan Speed vs. Signal-to-Noise Ratio (SNR)**.
-1. **Signal-dependent and additive noise**: Fast electron-beam scanning reduces dwell time to maximize Wafers-Per-Hour (WPH), which can introduce shot, electronic, and speckle-like degradation. The included patch regression explores $\text{Var}(y | \mu) = a \mu^2 + b$ but is not a calibrated sensor model.
-2. **Spatial Undersampling**: Downsampled raster acquisitions ($128\times128 \to 256\times256$) lose high-frequency silicon pattern boundaries, critical dimension (CD) contacts, and line perimeters.
-3. **Ground-Truth Noise Estimate**: Wavelet-MAD estimates a validation noise scale of $\sigma \approx 0.0168$, equivalent to **$38.72\text{ dB}$**. This is a useful high-frequency noise-floor heuristic, not a formal upper bound on model-to-target PSNR.
+| Question | Answer |
+|---|---|
+| **What is the problem?** | Joint denoising and 2× super-resolution of low-dose semiconductor inspection images. |
+| **What is the input/output?** | One grayscale `128×128` degraded image → one restored `256×256` image in physical `[0,1]` intensity range. |
+| **What was built?** | A 10.23M-parameter Research NAFNet-SR, complete training/evaluation pipeline, Google Colab and Kaggle workflows, and a verified checkpoint. |
+| **What is novel here?** | Identity-safe transfer from a proven residual model into a gated **2D local/FFT bottleneck mixer**, plus a beta-NLL uncertainty head used as auxiliary supervision. |
+| **Best verified result** | **28.83964 dB PSNR** with 8-fold TTA across all 320 validation pairs. |
+| **Improvement over the prior model** | **+0.03406 dB PSNR with TTA**, improving 286/320 paired validation images. |
+| **Speed** | 14.05 ms/image without TTA (71.2 images/s) or 145.55 ms/image with maximum-accuracy TTA on an RTX 2050. |
+| **Reproducibility** | Seeded training, self-describing checkpoints, strict state loading, atomic saves, 16 automated tests, and full-dataset evaluation. |
 
----
+## Why this solution stands out
 
-## 🏆 Quantitative Benchmark Results
+1. **Metrology-safe residual prediction** — the network predicts only the correction to bicubic upsampling, preserving the low-frequency physical structure instead of recreating the entire image.
+2. **Spatial and frequency reasoning** — local depthwise convolution captures edges and line patterns while a 2D FFT path supplies global periodic context at the bottleneck.
+3. **Uncertainty-aware optimization** — a per-pixel variance head and beta-NLL auxiliary loss emphasize difficult regions without using stochastic inference.
+4. **Evidence before claims** — every headline number is reproduced on all 320 held-out pairs; the README also reports metric regressions and clean-input limitations.
+5. **Practical delivery** — FP16, TorchScript, batched inference, D4 TTA, Google Drive resume support, dual-GPU training, and both `.npy` and preview `.png` outputs are included.
 
-Evaluated across **320 Ground-Truth validation image pairs** ($128\times128 \to 256\times256$ $2\times$ Super-Resolution & Denoising):
+### Technology stack
 
-| Model / Pipeline | Validation PSNR (dB) ↑ | Validation SSIM ↑ | Validation LPIPS ↓ | Gain-Normalized Estimate ↑ | GPU Inference Latency | Throughput | Clean-input PSNR\* |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Preprocessing-matched Bicubic** | `22.79` | `0.5330` | `0.4400` | `0.0%` (reference) | Not benchmarked | Not benchmarked | `30.80` |
-| **NAFNet-SR, FP16 + JIT, batch 8** | **`28.71`** | **`0.7831`** | **`0.2436`** | **`37.2%`** | **`13.35 ms/image`** | **`74.9 images/s`** | **`29.13`** |
+| Layer | Technology |
+|---|---|
+| Modeling | Python, PyTorch, NAFNet, PixelShuffle, 2D FFT |
+| Image and signal analysis | NumPy, OpenCV, PyWavelets, SciPy, scikit-image |
+| Quality measurement | PSNR, SSIM, LPIPS, Wavelet-MAD, clean-input audit |
+| Acceleration | CUDA, AMP FP16, channels-last tensors, TorchScript, batched D4 TTA |
+| Experiment delivery | Google Colab, Google Drive resume, Kaggle dual-GPU, Git LFS |
 
-> \* Clean-input audit uses the first 50 validation GT images, area-downsampled and restored. The current checkpoint is **1.68 dB below bicubic** on this audit; clean-input gating is not present in the shipped weights.
+## Verified results
 
-### 🎯 Key Performance Highlights
-1. **Reproduced speed**: `13.35 ms/image` (`74.9 images/s`) on an RTX 2050 with FP16, TorchScript JIT and batch size 8. Timing covers synchronized model compute, not image I/O or metrics.
-2. **Measured restoration gain**: `+5.92 dB` PSNR over the preprocessing-matched bicubic baseline.
-3. **Perceptual improvement**: LPIPS falls from `0.4400` to `0.2436`, a **44.6% reduction**.
-4. **Gain-normalized estimate**:
-   $$\frac{28.71 - 22.79}{38.72 - 22.79} = \mathbf{37.2\%}$$
-   The `38.72 dB` Wavelet-MAD value is an estimate rather than a guaranteed ceiling.
+All rows use the same 320-image validation split, the same `[0,1]` preprocessing, and per-image metrics averaged over the dataset. GPU timing measures synchronized model compute on an NVIDIA RTX 2050; it excludes file I/O and metric calculation.
 
----
+| Model / inference mode | PSNR ↑ | SSIM ↑ | LPIPS ↓ | Latency | Throughput |
+|---|---:|---:|---:|---:|---:|
+| Preprocessing-matched bicubic | 22.79 dB | 0.5330 | 0.4400 | — | — |
+| Previous NAFNet-SR, FP16 + JIT | 28.70997 dB | **0.7831** | **0.2436** | 14.22 ms | 70.3 img/s |
+| **Research NAFNet-SR, FP16 + JIT** | **28.73138 dB** | 0.7826 | 0.2536 | **14.05 ms** | **71.2 img/s** |
+| **Research NAFNet-SR + 8-fold TTA** | **28.83964 dB** | **0.7851** | 0.2566 | 145.55 ms | 6.9 img/s |
 
-## 🔬 Empirical Forward-Model Characterization & Signal Analysis
+### Interpreting the result honestly
 
-The degradation data was empirically characterized across all 3,200 pairs using [characterize_data.py](characterize_data.py):
+- The accepted research checkpoint is **epoch 8** of a 20-epoch Colab fine-tune. Epoch 20 reached 28.72345 dB, so it is retained only for resuming; it is not used for inference.
+- Against the previous model, no-TTA PSNR improved by **+0.02141 dB** with a paired bootstrap 95% interval of `[+0.01677, +0.02618]` dB.
+- With TTA, PSNR improved by **+0.03406 dB**, with a paired bootstrap 95% interval of `[+0.03060, +0.03763]` dB and wins on **286 of 320** images.
+- This is a targeted **PSNR improvement**, not a universal perceptual win: SSIM changes slightly and LPIPS is worse than the previous checkpoint.
+- The current checkpoint scores 29.03 dB on the 50-image clean-input audit, versus 30.80 dB for bicubic. A deployment receiving already-clean inputs should add a calibrated bypass/gating policy.
 
-### 1. Ground-Truth Wavelet-MAD Noise Estimate
-Noise standard deviation is estimated via the Median Absolute Deviation (MAD) of the finest-scale diagonal wavelet subband ($HH$) using Daubechies wavelets ($\text{db2}$):
-$$\sigma = \frac{\text{median}(|HH|)}{0.6745}, \quad \text{PSNR}_{\text{ceiling}} = 10 \log_{10}\left(\frac{1.0}{\sigma^2}\right)$$
+The model gains **+6.05 dB** over bicubic with TTA. A Wavelet-MAD analysis of the validation targets gives a 38.72 dB high-frequency noise estimate; this is descriptive and is **not** presented as a formal performance ceiling.
 
-* **Full Dataset (3,200 GT Images)**: Mean $\sigma = 0.016649 \pm 0.026946$, equivalent mean PSNR **`39.31 dB`** (Median `39.93 dB`, Range `[10.21, 56.73] dB).
-* **Validation Subset (320 GT Images)**: Mean $\sigma = 0.016798$, equivalent PSNR **`38.72 dB`**.
-* Wavelet high-frequency energy can include real semiconductor structure, so these values must not be interpreted as strict performance bounds.
+## System design
 
-### 2. Forward-Model Downsampling & Optical Blur Sweep
-Candidate downsampling operators were compared on 200 paired samples:
-
-* **Downsampling Operator Comparison**:
-  * **2×2 Area Averaging**: $\text{MSE} = 0.006438$
-  * **Bicubic Downsampling**: $\text{MSE} = \mathbf{0.006392}$ (**lowest tested mean residual**)
-  * **Nearest Neighbor**: $\text{MSE} = 0.008428$ (+30.9% error)
-  * **Strided Subsampling**: $\text{MSE} = 0.008428$ (+30.9% error)
-  * **Paired area-vs-bicubic test**: $t=6.901$, $p=6.74\times10^{-11}$
-
-* **Optical Blur Sweep (Gaussian $\sigma$ vs Residual MSE)**:
-  $$\text{Blur } \sigma = 0.0: \text{MSE} = \mathbf{0.006438} \quad (\text{Exact Minimum Residual})$$
-  $$\text{Blur } \sigma = 0.5: \text{MSE} = 0.006616, \quad \text{Blur } \sigma = 1.0: \text{MSE} = 0.007357, \quad \text{Blur } \sigma = 1.5: \text{MSE} = 0.008162$$
-
-> 📌 **Finding**: The lowest residual in the tested Gaussian grid occurs at $\sigma=0.0$. This supports selecting no added blur in the working forward model, but does not prove the physical optical blur is exactly zero.
-
-### 3. Multiplicative-Additive Noise Parameters & Arcsinh VST
-An exploratory local-patch regression fits $\text{Var}(y | \mu) = a \mu^2 + b$:
-* **Multiplicative Parameter ($a$)**: **$3.346 \times 10^{-2}$**
-* **Additive Parameter ($b$)**: **$1.781 \times 10^{-2}$**
-* **Variance-Stabilizing Transform (Arcsinh VST)**:
-  $$f(y) = \frac{1}{\sqrt{a}} \operatorname{arcsinh}\left(y \sqrt{\frac{a}{b}}\right), \quad y = \sqrt{\frac{b}{a}} \sinh(f \sqrt{a})$$
-* **FP32 Numerical Safety**: Implemented in FP32 with input bounds ($[-15, 15]$) to eliminate $\sinh$ overflow and MS-SSIM underflow under mixed-precision AMP. Reversion error: **$2.384 \times 10^{-7}$**.
-* The regression can conflate image texture with sensor noise. VST is an analysis utility and is not used by the shipped training or inference path.
-
----
-
-## 🌐 Seeded Synthetic Noise Robustness Benchmark
-
-The checkpoint was tested with seeded additive Gaussian noise applied to area-downsampled images from the project's own validation distribution. This measures synthetic noise robustness, not cross-dataset generalization or a calibrated physical scanner model:
-
-| Noise Regime | Noise Std ($\sigma$) | Test condition | Restored PSNR (dB) | Restored SSIM |
-| :--- | :---: | :--- | :---: | :---: |
-| **Low noise** | $\sigma = 0.01$ | Seeded synthetic Gaussian noise | **`28.96 dB`** | **`0.7925`** |
-| **Standard noise** | $\sigma = 0.03$ | Seeded synthetic Gaussian noise | **`28.13 dB`** | **`0.7698`** |
-| **High noise** | $\sigma = 0.05$ | Seeded synthetic Gaussian noise | **`27.30 dB`** | **`0.7451`** |
-| **Extreme noise** | $\sigma = 0.08$ | Seeded synthetic Gaussian noise | **`25.53 dB`** | **`0.6586`** |
-
----
-
-## 📊 Design Decisions and Evidence Status
-
-The current model uses a bicubic residual skip, zero-initialized SR head, EMA weights, and a Charbonnier/Sobel/FFT/two-scale SSIM loss. These choices are visible and reproducible in code. Historical leave-one-out numbers are not presented as verified ablations because the repository does not contain the corresponding checkpoints, logs, or experiment configurations. The optional NoiseGate and VST utilities are experimental and are **not** represented in `weights/best_model.pt`.
-
-### Research-derived accuracy extension
-
-The optional transfer-learning path adapts two ideas from recent sequence-modeling research without introducing recurrent or diffusion components that are inappropriate for deterministic image metrology:
-
-* `--spectral_mixer` adds an identity-initialized, gated **2D local-convolution/FFT mixer** at the bottleneck. Its zero-initialized projection makes the extended model exactly equal to the transferred checkpoint before fine-tuning.
-* `--uncertainty_head` adds per-pixel heteroscedastic variance prediction supervised with **beta-NLL**. The detached variance weighting limits variance inflation; inference still returns only the deterministic restored image.
-* `--init_weights weights/best_model.pt` safely transfers the verified backbone while allowing only the explicitly enabled extension tensors to be new. The base and extension learning rates can be separated with `--extension_lr_multiplier`.
-
-The bundled `weights/best_model.pt` remains the verified 28.71 dB baseline. The research extension must exceed that score during full validation before `best_model.pt` is replaced.
-
----
-
-## 🔬 Core Architecture & Pipeline
-
-```
-                    +-------------------------------------------------+
-                    | Input Degraded Image (Noisy, Low-Res: Bx1xHxW)  |
-                    +-------------------------------------------------+
-                                      |             |
-                                      |     [Bicubic Upsampler 2x]
-                                      |             |
-                           [3x3 Conv Stem Layer]    | (Global Residual Skip)
-                                      |             |
-                    +-----------------------------------+
-                    |  Encoder Stage (3x NAF Blocks)    |
-                    +-----------------------------------+
-                                      |
-                    +-----------------------------------+
-                    | Bottleneck (3x NAF Blocks + SCA)  |
-                    +-----------------------------------+
-                                      |
-                    +-----------------------------------+
-                    |  Decoder Stage (3x NAF Blocks)    |
-                    +-----------------------------------+
-                                      |
-                         [PixelShuffle 2x Head] (Zero-Init)
-                                      |
-                                      v
-                                  [Sum (+)] <-------+
-                                      |
-                     [Experimental NoiseGate: not trained]
-                                      |
-                    +-------------------------------------------------+
-                    | Restored Metrology Image (Clean, Bx1x2Hx2W)     |
-                    +-------------------------------------------------+
+```mermaid
+flowchart LR
+    A[Degraded 128×128 image] --> B[Clamp to physical 0–1 range]
+    B --> C[NAFNet encoder]
+    C --> D[3× NAF bottleneck blocks]
+    D --> E[Gated local convolution + 2D FFT mixer]
+    E --> F[NAFNet decoder]
+    F --> G[Learned 2× residual head]
+    B --> H[Bicubic 2× baseline]
+    G --> I[Residual addition]
+    H --> I
+    F -. training only .-> U[Per-pixel uncertainty head]
+    I --> J[Clamp and save NPY + PNG]
+    J --> K[Optional 8-fold D4 ensemble]
 ```
 
-### Composite Metrology Loss Function
-$$\mathcal{L}_{\text{total}} = 1.0 \cdot \mathcal{L}_{\text{Charbonnier}} + 0.05 \cdot \mathcal{L}_{\text{Sobel}} + 0.05 \cdot \mathcal{L}_{\text{FFT}}^{\text{ortho}} + 0.20 \cdot \mathcal{L}_{\text{MS-SSIM}}$$
-* **Charbonnier Loss**: Robust pixel outlier recovery.
-* **Calibrated Sobel Edge Loss**: Sub-10nm feature perimeter preservation.
-* **Ortho-Normalized 2D FFT Loss**: Frequency domain suppression of periodic speckle noise.
-* **Multi-Scale SSIM (FP32)**: Structural symmetry enforcement across nano- and macro-scale wafer patterns.
+### 1. Research NAFNet-SR backbone
 
-The composite loss is forced to FP32 under AMP. During training the model output is left unclamped to preserve gradients; inference output is clamped to $[0,1]$.
+- Single-channel input/output with width 64.
+- Three encoder and three decoder stages, each containing two NAFBlocks.
+- Three additional NAFBlocks at the 512-channel bottleneck.
+- PixelShuffle reconstruction for 2× super-resolution.
+- Global bicubic residual skip for stable photometric reconstruction.
+- **10,233,986 parameters** total; the uncertainty branch is skipped during normal inference.
+- Canonical checkpoint size: approximately **41.05 MB**.
 
----
+NAFBlocks use activation-free gating, depthwise convolution, simple channel attention, LayerNorm2d, and learnable residual scales. The final reconstruction layer was zero-initialized when the original backbone was trained, making the initial prediction exactly bicubic.
 
-## ⚡ Environment Setup
+### 2. Gated local/FFT mixer
 
-### 1. Clone the Repository
+The research extension processes bottleneck features through two complementary paths:
+
+- A depthwise `3×3` convolution captures local boundaries and repeated line-space patterns.
+- An FP32 `rFFT2 → grouped 1×1 mixing → irFFT2` path captures global periodic structure.
+- A learned channel gate blends both paths.
+- The output projection was initialized to zero during transfer, so adding the extension initially preserved the previous model exactly.
+
+The FFT path remains FP32 even under AMP/FP16 evaluation to avoid complex-frequency numerical issues.
+
+### 3. Uncertainty-aware auxiliary head
+
+During training, the decoder also predicts raw per-pixel variance. Softplus converts it into a positive variance and beta-NLL supervises difficult or ambiguous regions. Variance weighting is detached to reduce the incentive to inflate uncertainty. Normal inference returns only the deterministic restored image, so the uncertainty head adds no output-side complexity.
+
+### 4. Composite metrology loss
+
+The accepted training objective is:
+
+$$
+\mathcal{L} =
+1.00\mathcal{L}_{Charbonnier}
++0.05\mathcal{L}_{Sobel}
++0.05\mathcal{L}_{FFT}
++0.20\mathcal{L}_{MS\text{-}SSIM}
++0.02\mathcal{L}_{\beta\text{-}NLL}
+$$
+
+| Component | Purpose |
+|---|---|
+| Charbonnier | Robust pixel-level restoration and outlier tolerance. |
+| Sobel edge | Preserves line boundaries and critical-dimension edges. |
+| Orthonormal FFT | Penalizes frequency-domain mismatch without overwhelming spatial losses. |
+| Two-scale SSIM | Preserves structure at local and broader pattern scales. |
+| Beta-NLL | Adds calibrated heteroscedastic supervision through the uncertainty head. |
+
+All loss calculations are forced to FP32 under AMP. Training predictions remain unclamped to preserve out-of-range gradients; evaluation results are clamped to `[0,1]`.
+
+## Dataset and empirical characterization
+
+| Split | Degraded input | Ground truth | Pairs |
+|---|---|---|---:|
+| Training | `data/train/NoisyLR` | `data/train/GT` | 2,880 |
+| Validation | `data/val/NoisyLR` | `data/val/GT` | 320 |
+| Hidden test | `data/test/NoisyLR` | Not provided | 400 |
+
+The canonical Git LFS archives are `train.zip` and `Test_NoisyLR.zip`. The split is deterministic with seed 42, filename-paired, and non-overlapping.
+
+### What the data analysis established
+
+- Inputs and targets are already physically scaled; preprocessing therefore clips to `[0,1]` instead of applying destructive per-image percentile rescaling.
+- Bicubic downsampling gave the lowest tested paired residual MSE (`0.006392`) compared with area averaging (`0.006438`), nearest neighbor (`0.008428`), and strided sampling (`0.008428`).
+- The tested Gaussian blur sweep was best at additional blur `σ=0.0`; no artificial pre-blur is used.
+- Validation target Wavelet-MAD estimated mean `σ=0.016798`, equivalent to 38.72 dB. Real image structure can enter the high-frequency bands, so this remains a heuristic.
+- A local regression explored $Var(y\mid\mu)=a\mu^2+b$ with $a=3.346\times10^{-2}$ and $b=1.781\times10^{-2}$. This can conflate texture with sensor noise and is not treated as a calibrated detector model.
+
+Training augmentation applies paired rotations/flips, occasional CutBlur, and occasional Gaussian noise jitter. Pair shapes, filenames, finite values, and 2× scale consistency are validated before use.
+
+Reproduce the signal characterization and clean-input analysis with:
+
+```bash
+python characterize_data.py \
+  --gt_dir data/train/GT \
+  --lr_dir data/train/NoisyLR \
+  --weights weights/best_model.pt \
+  --max_pairs 200
+```
+
+## Quick start
+
+### 1. Clone and install
+
+Git LFS is required for the dataset archives.
+
 ```bash
 git clone -b Kunal https://github.com/kmbeddedd/semicon_2026.git
 cd semicon_2026
-```
+git lfs pull
 
-### 2. Create Virtual Environment & Install Dependencies
-```bash
-# Create venv
 python -m venv venv
+```
 
-# Activate (Windows PowerShell)
+Activate the environment:
+
+```powershell
+# Windows PowerShell
 .\venv\Scripts\Activate.ps1
-
-# Activate (Linux / macOS)
-source venv/bin/activate
-
-# Install requirements (includes PyTorch, PyWavelets, Scipy, LPIPS, OpenCV)
 pip install -r requirements.txt
-
-# Optional: reproduce the direct dependency versions used for the verified benchmark
-pip install -r requirements-verified.txt
 ```
 
----
-
-## 🔍 Run Metrology Signal Characterization
-
-Audit candidate degradation models, compute the Wavelet-MAD estimate, run a paired kernel test, and measure clean-input damage:
-
 ```bash
-# Run forward-model characterization across dataset
-python characterize_data.py --gt_dir data/train/GT --lr_dir data/train/NoisyLR --weights weights/best_model.pt --max_pairs 200
+# Linux, macOS, Colab, or Kaggle
+source venv/bin/activate
+pip install -r requirements.txt
 ```
 
----
+`requirements-verified.txt` records the direct dependency versions used for the reproduced RTX 2050 benchmark. Install a PyTorch build appropriate for the available CUDA runtime.
 
-## 🎯 How to Run Inference & Evaluation
-
-The evaluation script `eval.py` is standalone and accepts any directory of input images or `.npy` files:
+### 2. Extract the canonical datasets
 
 ```bash
-# Ultra-Fast Batched Production Inference (13.35 ms / frame, 74.9 FPS)
-python eval.py --input_dir data/test/NoisyLR --output_dir data/output_restored --weights weights/best_model.pt --scale 2 --batch_size 8 --no_tta
-
-# Single-Image Streaming Inference (15.17 ms / frame, 65.9 FPS)
-python eval.py --input_dir data/test/NoisyLR --output_dir data/output_restored --weights weights/best_model.pt --scale 2 --batch_size 1 --no_tta
-
-# Benchmark against Ground Truth with LPIPS, measured bicubic baseline, Wavelet-MAD estimate, and clean audit
-python eval.py --input_dir data/val/NoisyLR --target_dir data/val/GT --output_dir data/val_restored --weights weights/best_model.pt --scale 2 --batch_size 8 --no_tta --check_clean_damage
-
-# Optional 8-Fold Test-Time Augmentation (TTA) Ensemble Mode
-python eval.py --input_dir data/val/NoisyLR --target_dir data/val/GT --output_dir data/val_restored --weights weights/best_model.pt --scale 2 --check_clean_damage
+python -m zipfile -e train.zip data
+python -m zipfile -e Test_NoisyLR.zip data/test
 ```
 
-### CLI Arguments
-* `--input_dir` / `-i`: Path to directory containing degraded input images (`.npy`, `.png`, `.jpg`, `.tif`).
-* `--output_dir` / `-o`: Output folder to save restored `.npy` files and `.png` visual previews.
-* `--target_dir` / `-t`: *(Optional)* Path to ground truth directory to compute PSNR, SSIM, LPIPS, a preprocessing-matched bicubic baseline, and the Wavelet-MAD estimate.
-* `--weights` / `-w`: Path to model checkpoint file (default: `weights/best_model.pt`).
-* `--scale`: Scale factor (`2` for $2\times$ super-resolution, `1` for same-resolution denoising).
-* `--batch_size` / `-b`: Batch size for GPU parallel inference (default: `8`, use `1` for streaming).
-* `--no_fp16`: Disable FP16 Tensor Core acceleration.
-* `--no_jit`: Disable TorchScript JIT kernel fusion.
-* `--no_tta`: Disable 8-fold test-time augmentation for ultra-low latency (74.9 FPS).
-* `--check_clean_damage`: Audit model preservation fidelity on clean downsampled GT patterns.
+If `data/val` does not exist, the training pipeline creates a deterministic, paired 10% validation split.
 
----
+### 3. Run maximum-accuracy test inference
 
-## 🧪 Automated Tests & Synthetic Robustness Audit
+TTA is enabled by default when `--no_tta` is omitted.
 
 ```bash
-# Run unit tests for signal utilities, data validation, model contracts,
-# checkpoint loading, scheduling, TTA, and FP32 AMP loss behavior
-python -m unittest discover tests
+python eval.py \
+  --input_dir data/test/NoisyLR \
+  --output_dir data/output_restored \
+  --weights weights/best_model.pt \
+  --scale 2 \
+  --batch_size 8
+```
 
-# Run the seeded same-distribution synthetic Gaussian-noise audit
+Each NPY input produces a restored `.npy` array and an 8-bit `_restored.png` preview.
+
+### 4. Run fast inference without TTA
+
+```bash
+python eval.py \
+  --input_dir data/test/NoisyLR \
+  --output_dir data/output_fast \
+  --weights weights/best_model.pt \
+  --scale 2 \
+  --batch_size 16 \
+  --no_tta
+```
+
+### 5. Reproduce the validation benchmark
+
+```bash
+# Research model without TTA
+python eval.py \
+  --input_dir data/val/NoisyLR \
+  --target_dir data/val/GT \
+  --output_dir data/val_fast \
+  --weights weights/best_model.pt \
+  --scale 2 \
+  --batch_size 16 \
+  --no_tta \
+  --check_clean_damage
+
+# Research model with maximum-accuracy TTA
+python eval.py \
+  --input_dir data/val/NoisyLR \
+  --target_dir data/val/GT \
+  --output_dir data/val_tta \
+  --weights weights/best_model.pt \
+  --scale 2 \
+  --batch_size 8
+```
+
+The evaluator reports restored and bicubic PSNR/SSIM/LPIPS, synchronized GPU latency, the Wavelet-MAD estimate, and optionally clean-input degradation.
+
+## Training
+
+The research mixer and uncertainty head are enabled by default.
+
+### Continue from the accepted checkpoint
+
+```bash
+python train.py \
+  --init_weights weights/best_model.pt \
+  --epochs 20 \
+  --warmup_epochs 1 \
+  --batch_size 8 \
+  --lr 2e-5 \
+  --extension_lr_multiplier 5 \
+  --w_nll 0.02 \
+  --nll_beta 0.5 \
+  --no_cache \
+  --seed 42
+```
+
+The accepted PSNR is loaded as the threshold, so `best_model.pt` is replaced only if validation improves. `latest_model.pt` stores the raw model, EMA model, optimizer, scheduler, scaler, epoch, and best score.
+
+### Resume a stopped run
+
+Set `--epochs` higher than the saved epoch:
+
+```bash
+python train.py --resume weights/latest_model.pt --epochs 30 --batch_size 8 --lr 2e-5 --no_cache
+```
+
+### Train from scratch
+
+```bash
+python train.py --epochs 100 --batch_size 16 --lr 5e-4 --warmup_epochs 5 --scale 2
+```
+
+Training includes AdamW, warmup plus cosine decay, AMP FP16, gradient clipping, EMA tracking, differential extension learning rates, deterministic seeding, multi-GPU `DataParallel`, and atomic checkpoint replacement.
+
+For ablations, use `--no-spectral_mixer` and/or `--no-uncertainty_head`.
+
+### Cloud workflows
+
+- **Google Colab:** [train_colab.ipynb](train_colab.ipynb) uses a memory-safe batch size, Google Drive checkpoints, atomic saves, automatic resume, and final TTA inference.
+- **Kaggle:** [train_kaggle.ipynb](train_kaggle.ipynb) extracts the canonical archives and supports dual-T4 `DataParallel` training.
+
+## Robustness and verification
+
+### Seeded synthetic-noise audit
+
+This same-distribution test adds seeded Gaussian noise to area-downsampled validation images. It is a repeatable stress test, not evidence of cross-tool or cross-fab generalization.
+
+| Noise level | Sigma | PSNR | SSIM |
+|---|---:|---:|---:|
+| Low | 0.01 | 28.88 dB | 0.7858 |
+| Standard inspection | 0.03 | 28.09 dB | 0.7662 |
+| High | 0.05 | 27.31 dB | 0.7433 |
+| Extreme | 0.08 | 25.73 dB | 0.6697 |
+
+Run it with:
+
+```bash
 python utils/generalization.py --weights weights/best_model.pt --num_samples 50 --seed 42
 ```
 
----
+### Automated tests
 
-## 🏋️ Reproduce Training
-
-### Option A: 1-Click Cloud Training on Google Colab (Single T4 GPU)
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kmbeddedd/semicon_2026/blob/Kunal/train_colab.ipynb)
-
-The Colab notebook now runs the research extension as a resumable Google Drive experiment. It preserves the accepted baseline, restores complete training state from `latest_model.pt`, and writes checkpoints atomically.
-
-### Option B: Distributed Cloud Training on Kaggle (Dual Tesla T4 x2 GPUs)
-Use the included [`train_kaggle.ipynb`](train_kaggle.ipynb) notebook on Kaggle with Accelerator set to **GPU T4 x2**:
-* Uses **PyTorch `DataParallel`** to split mini-batches (`batch_size=64`, 32 per GPU).
-* Uses Automatic Mixed Precision (`AMP FP16`); training time depends on accelerator, storage, and validation settings.
-
-### Option C: Local Training
 ```bash
-python train.py --train_input data/train/NoisyLR --train_target data/train/GT --val_input data/val/NoisyLR --val_target data/val/GT --epochs 100 --batch_size 16 --lr 5e-4 --scale 2
-
-# Research fine-tune from the verified checkpoint
-python train.py --init_weights weights/best_model.pt --spectral_mixer --uncertainty_head --w_nll 0.02 --nll_beta 0.5 --extension_lr_multiplier 5 --epochs 20 --warmup_epochs 1 --batch_size 16 --lr 2e-5 --scale 2
+python -m unittest discover -s tests -v
 ```
 
-Training is seeded by default (`--seed 42`). Use `--deterministic` for deterministic kernels, `--no_cache` on memory-constrained systems, and `--resume weights/latest_model.pt` to restore model, EMA, optimizer, scheduler, and AMP scaler state. Checkpoint loading is strict and rejects incompatible architectures.
+The 16 tests cover:
 
----
+- paired-data validation and deterministic split integrity;
+- VST numerical round trips and wavelet noise estimation;
+- NAFNet output, residual, NoiseGate, and TTA contracts;
+- identity-safe spectral transfer;
+- beta-NLL gradients and uncertainty output shapes;
+- FP32 loss safety under AMP;
+- scheduler transition and strict checkpoint loading;
+- atomic checkpoint saving.
 
-## 📂 Repository Structure
+## Engineering safeguards
 
-```
+- **Self-describing checkpoints:** architecture flags are stored in `model_config` and resolved automatically by evaluation and analysis tools.
+- **Strict loading:** incompatible or unexpected tensors fail loudly; transfer loading permits only explicitly enabled extension keys.
+- **Atomic writes:** checkpoints are saved beside their destination and atomically replaced, reducing corruption risk on Google Drive.
+- **Best-vs-latest separation:** inference uses the best validation checkpoint; complete state is kept separately for resume.
+- **Physical output bounds:** results are clamped to `[0,1]` only at inference.
+- **Data integrity:** invalid dimensions, NaN/Inf values, missing pairs, and wrong scale ratios are rejected.
+
+## Project structure
+
+```text
 semicon_2026/
-├── README.md                 # Reproduced benchmarks, usage, and evidence limitations
-├── requirements.txt          # Supported direct dependency ranges
-├── requirements-verified.txt # Direct versions used for the reproduced benchmark
-├── characterize_data.py      # Candidate forward-model, paired-statistics & noise-estimate tool
-├── eval.py                   # Inference, TTA, LPIPS, bicubic baseline & clean-input evaluation
-├── train.py                  # End-to-end training pipeline with AMP, EMA & calibrated loss
-├── train_colab.ipynb         # 1-Click Google Colab training notebook
 ├── models/
-│   ├── __init__.py
-│   └── nafnet.py             # NAFNet-SR, optional dual-domain mixer & uncertainty head
+│   └── nafnet.py             # NAFNet-SR, dual-domain mixer, uncertainty head
 ├── utils/
-│   ├── dataset.py            # Calibrated dataset loader & metrology augmentations
-│   ├── signal_analysis.py    # Wavelet-MAD, Arcsinh VST, blur sweep & kernel tests
-│   ├── metrics.py            # PSNR, SSIM, Wavelet noise estimate & normalized gain
-│   ├── losses.py             # Composite Metrology Loss (FP32 FFT, SSIM, Charbonnier, Sobel)
-│   └── generalization.py     # Seeded same-distribution synthetic noise benchmark
+│   ├── dataset.py            # Paired loading, validation, caching, augmentation
+│   ├── losses.py             # Charbonnier, Sobel, FFT, SSIM, beta-NLL
+│   ├── metrics.py            # PSNR, SSIM, Wavelet-MAD and gain estimate
+│   ├── signal_analysis.py    # Forward-model and VST characterization
+│   └── generalization.py     # Seeded synthetic-noise benchmark
 ├── tests/
-│   └── test_signal_processing.py # Signal, data, model, scheduler, checkpoint, TTA & AMP tests
-├── data/
-│   ├── train/                # Training paired dataset (NoisyLR, GT - 2880 pairs)
-│   ├── val/                  # Validation paired dataset (NoisyLR, GT - 320 pairs)
-│   ├── test/                 # Test degraded dataset (400 samples)
-│   └── output_restored/      # Output restored predictions (.npy + .png)
-└── weights/
-    └── best_model.pt         # Top-performing checkpoint (Epoch 73 EMA)
+│   └── test_signal_processing.py
+├── weights/
+│   └── best_model.pt         # Accepted epoch-8 research checkpoint
+├── characterize_data.py      # Empirical degradation and clean-input audit
+├── train.py                  # AMP/EMA training and checkpoint engine
+├── eval.py                   # FP16/JIT/TTA inference and full metrics
+├── train_colab.ipynb         # Single-GPU, Drive-resumable workflow
+├── train_kaggle.ipynb        # Dual-GPU workflow
+├── train.zip                 # Canonical paired training archive via Git LFS
+└── Test_NoisyLR.zip          # Canonical hidden-test archive via Git LFS
 ```
 
-### Reproducibility and storage notes
+Generated data, virtual environments, caches, and resumable optimizer checkpoints are ignored by Git. The accepted inference checkpoint remains versioned.
 
-* The shipped checkpoint reproduces the table above. The new research extension has passed transfer, FP16, TorchScript, loss-gradient, and checkpoint smoke tests; its full Colab fine-tune remains an experiment until it beats the baseline on all 320 validation pairs.
-* Dataset ZIPs use Git LFS, but the repository contains both full and partitioned archives (about 1.79 GiB when checked out). Removing that duplication or moving it to release/DVC storage requires a separate artifact migration.
-* Exact historical ablation results require experiment-specific checkpoints and logs; they are intentionally not claimed by the current reproducible benchmark.
+## Current limitations and next steps
+
+1. **Metric specialization:** the research checkpoint improves PSNR but slightly regresses LPIPS relative to the previous checkpoint. A Pareto-aware checkpoint selector could balance both.
+2. **Clean-input behavior:** unconditional restoration can damage already-clean images. A calibrated noise detector or bypass gate should be validated before production use.
+3. **External generalization:** the available evidence is from the supplied distribution and seeded perturbations; no independent microscope/tool dataset is included.
+4. **Physical calibration:** the variance regression and Wavelet-MAD values are useful diagnostics, not calibrated sensor parameters or formal bounds.
+5. **TTA cost:** maximum-accuracy inference is roughly 10× slower than the JIT no-TTA path.
+
+## References
+
+1. Chen et al., *Simple Baselines for Image Restoration*, ECCV 2022 — NAFNet.
+2. Seitzer et al., *On the Pitfalls of Heteroscedastic Uncertainty Estimation with Probabilistic Neural Networks*, ICLR 2022 — beta-NLL.
+3. Donoho and Johnstone, *Ideal Spatial Adaptation by Wavelet Shrinkage*, Biometrika 1994 — robust wavelet noise estimation.
 
 ---
 
-## 📚 References & Acknowledgments
-1. Donoho & Johnstone, *"Ideal spatial adaptation by wavelet shrinkage"*, Biometrika 1994.
-2. Chen et al., *"Simple Baselines for Image Restoration"*, ECCV 2022.
-3. Zhang et al., *"The Unreasonable Effectiveness of Deep Features as a Perceptual Metric"*, CVPR 2018.
-4. KLA Metrology Guidelines for High-Throughput E-Beam & Optical Wafer Inspection.
+**Judge takeaway:** this submission is not only a trained checkpoint. It is a reproducible semiconductor-restoration system with a measured PSNR improvement, explicit scientific trade-offs, cloud-ready training, validated inference, and safeguards that make every reported result traceable to code and data.

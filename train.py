@@ -154,9 +154,19 @@ def parse_args():
     parser.add_argument("--ema_decay", type=float, default=0.999, help="Exponential moving average decay factor")
     parser.add_argument("--resume", type=str, default="", help="Optional path to checkpoint (.pt) to resume training from")
     parser.add_argument("--init_weights", type=str, default="", help="Initialize an extended architecture from compatible base weights")
-    parser.add_argument("--spectral_mixer", action="store_true", help="Enable the identity-initialized local/FFT bottleneck mixer")
-    parser.add_argument("--uncertainty_head", action="store_true", help="Train a heteroscedastic uncertainty head with beta-NLL")
-    parser.add_argument("--w_nll", type=float, default=0.05, help="Beta-NLL auxiliary loss weight when --uncertainty_head is enabled")
+    parser.add_argument(
+        "--spectral_mixer",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable the local/FFT bottleneck mixer (default: enabled)",
+    )
+    parser.add_argument(
+        "--uncertainty_head",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Train the heteroscedastic uncertainty head with beta-NLL (default: enabled)",
+    )
+    parser.add_argument("--w_nll", type=float, default=0.02, help="Beta-NLL auxiliary loss weight when --uncertainty_head is enabled")
     parser.add_argument("--nll_beta", type=float, default=0.5, help="Detached variance weighting exponent for beta-NLL")
     parser.add_argument("--extension_lr_multiplier", type=float, default=1.0, help="LR multiplier for spectral/uncertainty modules during transfer training")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducible training")
