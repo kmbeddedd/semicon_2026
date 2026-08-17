@@ -263,8 +263,12 @@ python train.py \
   --epochs 20 \
   --warmup_epochs 1 \
   --batch_size 8 \
-  --lr 2e-5 \
-  --extension_lr_multiplier 5 \
+  --auto_batch_size \
+  --target_vram_fraction 0.88 \
+  --max_batch_size 64 \
+  --num_workers 2 \
+  --lr 1e-5 \
+  --extension_lr_multiplier 1 \
   --w_nll 0.02 \
   --nll_beta 0.5 \
   --no_cache \
@@ -272,6 +276,8 @@ python train.py \
 ```
 
 The accepted PSNR is loaded as the threshold, so `best_model.pt` is replaced only if validation improves. `latest_model.pt` stores the raw model, EMA model, optimizer, scheduler, scaler, epoch, and best score.
+
+`--auto_batch_size` executes the real full-resolution AMP forward, loss, and backward path, then binary-searches for the largest even batch inside the requested CUDA budget. On a 15 GiB Colab T4, `0.88` is expected to reserve roughly 13 GiB while retaining workspace headroom. Each epoch reports peak allocated, reserved, and total VRAM. Targeting 100% is intentionally unsupported because allocator variation and cuDNN/cuFFT workspaces can otherwise trigger an OOM after training has started.
 
 ### Resume a stopped run
 
@@ -293,7 +299,7 @@ For ablations, use `--no-spectral_mixer` and/or `--no-uncertainty_head`.
 
 ### Cloud workflows
 
-- **Google Colab:** [train_colab.ipynb](train_colab.ipynb) uses a memory-safe batch size, Google Drive checkpoints, atomic saves, automatic resume, and final TTA inference.
+- **Google Colab:** [train_colab.ipynb](train_colab.ipynb) auto-fills approximately 88% of the available GPU VRAM, uses local-disk workers, writes checkpoints to Google Drive, and performs final TTA inference.
 - **Kaggle:** [train_kaggle.ipynb](train_kaggle.ipynb) extracts the canonical archives and supports dual-T4 `DataParallel` training.
 
 ## Robustness and verification
@@ -337,6 +343,7 @@ The 16 tests cover:
 - **Self-describing checkpoints:** architecture flags are stored in `model_config` and resolved automatically by evaluation and analysis tools.
 - **Strict loading:** incompatible or unexpected tensors fail loudly; transfer loading permits only explicitly enabled extension keys.
 - **Atomic writes:** checkpoints are saved beside their destination and atomically replaced, reducing corruption risk on Google Drive.
+- **Measured VRAM autotuning:** the trainer probes the actual model/loss/backward path and leaves explicit CUDA workspace headroom instead of relying on a fixed Colab batch.
 - **Best-vs-latest separation:** inference uses the best validation checkpoint; complete state is kept separately for resume.
 - **Physical output bounds:** results are clamped to `[0,1]` only at inference.
 - **Data integrity:** invalid dimensions, NaN/Inf values, missing pairs, and wrong scale ratios are rejected.

@@ -1,6 +1,7 @@
 import os
 import argparse
 import copy
+import gc
 import math
 import random
 import glob
@@ -77,6 +78,110 @@ def atomic_torch_save(payload, path):
     os.replace(temp_path, path)
 
 
+def autotune_cuda_batch_size(
+    model,
+    criterion,
+    device,
+    input_shape,
+    target_shape,
+    use_amp,
+    return_uncertainty,
+    target_fraction=0.88,
+    max_batch_size=64,
+):
+    """Find the largest even training batch that stays inside a CUDA memory budget.
+
+    The probe executes the real AMP forward, composite loss, and backward pass.
+    A reserve is added for Adam's lazily-created moment tensors and allocator
+    variation. The model is not stepped, so checkpoint weights remain unchanged.
+    """
+    if device.type != "cuda":
+        raise ValueError("CUDA batch-size autotuning requires a CUDA device")
+    if torch.cuda.device_count() != 1:
+        raise ValueError("CUDA batch-size autotuning currently supports one GPU")
+    if not 0.5 <= target_fraction <= 0.95:
+        raise ValueError("target_fraction must be between 0.5 and 0.95")
+    if max_batch_size < 2:
+        raise ValueError("max_batch_size must be at least 2")
+
+    total_bytes = torch.cuda.get_device_properties(device).total_memory
+    target_bytes = int(total_bytes * target_fraction)
+    trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
+    # AdamW creates two FP32 moment tensors lazily. Keep at least 256 MiB for
+    # those tensors plus small cuDNN/cuFFT and allocator variations.
+    lazy_state_reserve = max(8 * trainable_params, 256 * 1024 ** 2)
+    was_training = model.training
+    model.train()
+    probe_results = {}
+
+    def probe(batch_size):
+        model.zero_grad(set_to_none=True)
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+        inp = target = prediction = raw_variance = loss = None
+        try:
+            inp = torch.zeros((batch_size, *input_shape), device=device, dtype=torch.float32)
+            target = torch.zeros((batch_size, *target_shape), device=device, dtype=torch.float32)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                if return_uncertainty:
+                    prediction, raw_variance = model(inp, return_uncertainty=True)
+                else:
+                    prediction, raw_variance = model(inp), None
+                loss, _ = criterion(prediction, target, raw_variance=raw_variance)
+            loss.backward()
+            torch.cuda.synchronize(device)
+            peak_allocated = torch.cuda.max_memory_allocated(device)
+            peak_reserved = torch.cuda.max_memory_reserved(device)
+            projected_peak = max(peak_reserved, peak_allocated + lazy_state_reserve)
+            fits = projected_peak <= target_bytes
+            probe_results[batch_size] = (fits, peak_allocated, peak_reserved, projected_peak)
+            print(
+                f"[VRAM Auto-Batch] batch={batch_size:02d} | "
+                f"allocated={peak_allocated / 1024 ** 3:.2f} GiB | "
+                f"reserved={peak_reserved / 1024 ** 3:.2f} GiB | "
+                f"projected={projected_peak / 1024 ** 3:.2f} GiB | "
+                f"budget={target_bytes / 1024 ** 3:.2f} GiB | "
+                f"{'FIT' if fits else 'OVER'}"
+            )
+            return fits
+        except torch.cuda.OutOfMemoryError:
+            probe_results[batch_size] = (False, 0, 0, total_bytes)
+            print(f"[VRAM Auto-Batch] batch={batch_size:02d} | CUDA OOM")
+            return False
+        finally:
+            model.zero_grad(set_to_none=True)
+            del inp, target, prediction, raw_variance, loss
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    # Search even batch sizes because they are efficient on Tensor Core GPUs.
+    unit_max = max_batch_size // 2
+    low, high, best_units = 1, max(unit_max, 1), 0
+    while low <= high:
+        mid = (low + high) // 2
+        candidate = min(max_batch_size, max(2, mid * 2))
+        if probe(candidate):
+            best_units = mid
+            low = mid + 1
+        else:
+            high = mid - 1
+
+    selected = best_units * 2
+    if selected == 0:
+        if not probe(1):
+            raise RuntimeError("Batch size 1 does not fit the requested CUDA memory budget")
+        selected = 1
+
+    model.train(was_training)
+    torch.cuda.reset_peak_memory_stats(device)
+    print(
+        f"[VRAM Auto-Batch] Selected batch size {selected} for "
+        f"{target_fraction * 100:.1f}% of {total_bytes / 1024 ** 3:.2f} GiB VRAM."
+    )
+    return selected, probe_results
+
+
 def ensure_validation_split(args):
     """Create a deterministic, non-overlapping paired validation split when needed."""
     valid_exts = ('*.npy', '*.NPY', '*.png', '*.PNG', '*.jpg', '*.JPG', '*.jpeg', '*.JPEG', '*.tif', '*.TIF')
@@ -144,6 +249,9 @@ def parse_args():
     parser.add_argument("--save_dir", type=str, default="weights", help="Directory to save model checkpoints")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
+    parser.add_argument("--auto_batch_size", action="store_true", help="Probe the largest safe CUDA training batch before creating DataLoaders")
+    parser.add_argument("--target_vram_fraction", type=float, default=0.88, help="Target CUDA memory fraction for --auto_batch_size (0.50-0.95)")
+    parser.add_argument("--max_batch_size", type=int, default=64, help="Maximum batch considered by --auto_batch_size")
     parser.add_argument("--lr", type=float, default=5e-4, help="Peak learning rate")
     parser.add_argument("--warmup_epochs", type=int, default=5, help="Number of linear warmup epochs")
     parser.add_argument("--scale", type=int, default=2, help="Scale factor (1 for same-res denoising, 2 for SR)")
@@ -235,6 +343,12 @@ def main():
         raise ValueError("--w_nll must be non-negative")
     if args.extension_lr_multiplier <= 0:
         raise ValueError("--extension_lr_multiplier must be positive")
+    if args.batch_size < 1:
+        raise ValueError("--batch_size must be positive")
+    if args.max_batch_size < 2:
+        raise ValueError("--max_batch_size must be at least 2")
+    if not 0.5 <= args.target_vram_fraction <= 0.95:
+        raise ValueError("--target_vram_fraction must be between 0.5 and 0.95")
     seed_everything(args.seed, deterministic=args.deterministic)
     args = auto_detect_dataset_paths(args)
     os.makedirs(args.save_dir, exist_ok=True)
@@ -260,23 +374,9 @@ def main():
         print(f"[Metrology Training] ERROR: No valid training image pairs found in '{args.train_input}' and '{args.train_target}'.")
         return
 
-    train_generator = torch.Generator()
-    train_generator.manual_seed(args.seed)
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=(args.num_workers > 0),
-        worker_init_fn=seed_worker,
-        generator=train_generator
-    )
-
     val_ds = PairedSemiconDataset(args.val_input, args.val_target, is_train=False, scale_factor=args.scale, cache_in_memory=cache_in_memory) if (os.path.exists(args.val_input) and os.path.exists(args.val_target)) else None
     if val_ds and len(val_ds) == 0:
         val_ds = None
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=(device.type == "cuda")) if val_ds else None
 
     # Model Architecture with Bicubic Skip
     model_config = {
@@ -383,10 +483,56 @@ def main():
         nll_beta=args.nll_beta,
     ).to(device)
 
-    print(f"[Metrology Training] Training {len(train_ds)} samples for {args.epochs} epochs (Batch Size: {args.batch_size})...")
+    if args.auto_batch_size:
+        if device.type != "cuda":
+            print("[VRAM Auto-Batch] CUDA is unavailable; using configured --batch_size.")
+        elif torch.cuda.device_count() != 1:
+            print("[VRAM Auto-Batch] Multi-GPU run detected; using configured --batch_size per DataParallel run.")
+        else:
+            sample_inp, sample_target, _ = train_ds[0]
+            args.batch_size, _ = autotune_cuda_batch_size(
+                model=model,
+                criterion=criterion,
+                device=device,
+                input_shape=tuple(sample_inp.shape),
+                target_shape=tuple(sample_target.shape),
+                use_amp=use_amp,
+                return_uncertainty=args.uncertainty_head,
+                target_fraction=args.target_vram_fraction,
+                max_batch_size=args.max_batch_size,
+            )
+            # Probing consumes RNG state; restore the requested experiment seed.
+            seed_everything(args.seed, deterministic=args.deterministic)
+
+    train_generator = torch.Generator()
+    train_generator.manual_seed(args.seed)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(args.num_workers > 0),
+        worker_init_fn=seed_worker,
+        generator=train_generator,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+    ) if val_ds else None
+
+    print(
+        f"[Metrology Training] Training {len(train_ds)} samples for {args.epochs} epochs "
+        f"(Batch Size: {args.batch_size}, Updates/Epoch: {len(train_loader)})..."
+    )
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         epoch_lr = optimizer.param_groups[0]["lr"]
         running_loss = 0.0
         running_parts = {"charb": 0.0, "edge": 0.0, "fft": 0.0, "ssim": 0.0, "nll": 0.0}
@@ -460,7 +606,23 @@ def main():
             val_bicubic_psnr = metric_sums["bicubic_psnr"] / val_sample_count
 
         eff_ema = relative_ceiling_efficiency(val_psnr_ema, 38.72, val_bicubic_psnr) if val_loader else 0.0
-        print(f"Epoch [{epoch:03d}/{args.epochs:03d}] (LR: {epoch_lr:.6f}) - Loss: {avg_loss:.4f} [C:{avg_parts['charb']:.3f}|E:{avg_parts['edge']:.3f}|F:{avg_parts['fft']:.3f}|S:{avg_parts['ssim']:.3f}|N:{avg_parts['nll']:.3f}] | Val PSNR: {val_psnr:.2f}dB (EMA: {val_psnr_ema:.2f}dB, Bicubic: {val_bicubic_psnr:.2f}dB, {eff_ema:.1f}% estimated gain) | Val SSIM: {val_ssim:.4f} (EMA: {val_ssim_ema:.4f})")
+        vram_text = ""
+        if device.type == "cuda":
+            total_vram = torch.cuda.get_device_properties(device).total_memory
+            peak_allocated = torch.cuda.max_memory_allocated(device)
+            peak_reserved = torch.cuda.max_memory_reserved(device)
+            vram_text = (
+                f" | VRAM peak: {peak_allocated / 1024 ** 3:.2f} GiB allocated / "
+                f"{peak_reserved / 1024 ** 3:.2f} GiB reserved / {total_vram / 1024 ** 3:.2f} GiB total"
+            )
+        print(
+            f"Epoch [{epoch:03d}/{args.epochs:03d}] (LR: {epoch_lr:.6f}) - Loss: {avg_loss:.4f} "
+            f"[C:{avg_parts['charb']:.3f}|E:{avg_parts['edge']:.3f}|F:{avg_parts['fft']:.3f}|"
+            f"S:{avg_parts['ssim']:.3f}|N:{avg_parts['nll']:.3f}] | Val PSNR: {val_psnr:.2f}dB "
+            f"(EMA: {val_psnr_ema:.2f}dB, Bicubic: {val_bicubic_psnr:.2f}dB, "
+            f"{eff_ema:.1f}% estimated gain) | Val SSIM: {val_ssim:.4f} "
+            f"(EMA: {val_ssim_ema:.4f}){vram_text}"
+        )
 
         raw_m = model.module if hasattr(model, "module") else model
         model_sd = raw_m.state_dict()
