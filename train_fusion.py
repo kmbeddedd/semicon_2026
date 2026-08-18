@@ -1,18 +1,17 @@
-"""Train the experimental NAFNet + official MambaIRv2-Light fusion model."""
+"""Train the experimental NAFNet + official full/Light MambaIRv2 fusion model."""
 
 import argparse
 import os
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from models.fusion import (
-    MAMBAIRV2_LIGHT_X2_CONFIG,
+    MAMBAIRV2_X2_CONFIGS,
     GlobalLocalFusionSR,
     GrayscaleMambaIRv2,
     build_model_from_checkpoint,
-    build_official_mambairv2_light,
+    build_official_mambairv2,
     extract_model_state,
 )
 from models.nafnet import NAFNetSR, resolve_nafnet_config
@@ -39,16 +38,22 @@ def parse_args():
     parser.add_argument("--val_input", default="data/val/NoisyLR")
     parser.add_argument("--val_target", default="data/val/GT")
     parser.add_argument("--local_weights", default="weights/best_model.pt")
-    parser.add_argument("--global_weights", default="", help="Official MambaIRv2-Light x2 checkpoint")
+    parser.add_argument("--global_weights", default="", help="Official MambaIRv2 x2 checkpoint matching --mambair_variant")
     parser.add_argument("--mambair_repo", required=True, help="Checkout of https://github.com/csguoh/MambaIR")
+    parser.add_argument(
+        "--mambair_variant",
+        choices=tuple(MAMBAIRV2_X2_CONFIGS),
+        default="base",
+        help="Official x2 architecture to use; base is the full classic-SR model",
+    )
     parser.add_argument("--resume", default="")
     parser.add_argument("--save_dir", default="weights/fusion_experiment")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--warmup_epochs", type=int, default=1)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--auto_batch_size", action="store_true")
-    parser.add_argument("--target_vram_fraction", type=float, default=0.85)
-    parser.add_argument("--max_batch_size", type=int, default=32)
+    parser.add_argument("--target_vram_fraction", type=float, default=0.82)
+    parser.add_argument("--max_batch_size", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--no_cache", action="store_true")
     parser.add_argument("--no_amp", action="store_true")
@@ -83,7 +88,7 @@ def parse_args():
 
 def _validate_args(args):
     if args.scale != 2:
-        raise ValueError("The provided MambaIRv2-Light preset is an x2 model")
+        raise ValueError("The provided MambaIRv2 presets are x2 models")
     if args.resume and (args.local_weights or args.global_weights):
         # local_weights has a useful default, so only reject an explicit global initializer.
         if args.global_weights:
@@ -96,6 +101,10 @@ def _validate_args(args):
         raise ValueError("--add_probability must be in [0, 1]")
     if not 0.5 <= args.target_vram_fraction <= 0.95:
         raise ValueError("--target_vram_fraction must be between 0.5 and 0.95")
+    if args.batch_size < 1:
+        raise ValueError("--batch_size must be positive")
+    if args.max_batch_size < 2:
+        raise ValueError("--max_batch_size must be at least 2")
     for name in ("local_lr", "fusion_lr", "global_lr"):
         if getattr(args, name) <= 0:
             raise ValueError(f"--{name} must be positive")
@@ -114,8 +123,12 @@ def _new_model(args, device):
     local_model = NAFNetSR(**local_config)
     load_model_state_strict(local_model, extract_model_state(local_checkpoint))
 
-    global_config = dict(MAMBAIRV2_LIGHT_X2_CONFIG)
-    global_backbone = build_official_mambairv2_light(args.mambair_repo, global_config)
+    global_config = dict(MAMBAIRV2_X2_CONFIGS[args.mambair_variant])
+    global_backbone = build_official_mambairv2(
+        args.mambair_repo,
+        variant=args.mambair_variant,
+        config=global_config,
+    )
     global_checkpoint = torch.load(args.global_weights, map_location="cpu")
     global_backbone.load_state_dict(extract_model_state(global_checkpoint), strict=True)
 
@@ -129,7 +142,7 @@ def _new_model(args, device):
     ).to(device)
     config = {
         "local_config": local_config,
-        "global_backend": "mambairv2_light",
+        "global_backend": f"mambairv2_{args.mambair_variant}",
         "global_config": global_config,
         "fusion_hidden": args.fusion_hidden,
         "use_uncertainty": bool(local_config["predict_uncertainty"]),
@@ -306,7 +319,8 @@ def main():
     model = torch.nn.DataParallel(raw_model) if torch.cuda.device_count() > 1 else raw_model
     print(
         f"[Fusion Training] samples={len(train_dataset)} | batch={args.batch_size} | "
-        f"augmentation={args.augmentation} | accepted threshold={best_psnr:.5f} dB"
+        f"global={model_config['global_backend']} | augmentation={args.augmentation} | "
+        f"accepted threshold={best_psnr:.5f} dB"
     )
 
     for epoch in range(start_epoch, args.epochs + 1):

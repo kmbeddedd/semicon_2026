@@ -35,6 +35,30 @@ MAMBAIRV2_LIGHT_X2_CONFIG = {
     "resi_connection": "1conv",
 }
 
+MAMBAIRV2_BASE_X2_CONFIG = {
+    "img_size": 64,
+    "patch_size": 1,
+    "in_chans": 3,
+    "embed_dim": 174,
+    "d_state": 16,
+    "depths": (6, 6, 6, 6, 6, 6),
+    "num_heads": (6, 6, 6, 6, 6, 6),
+    "window_size": 16,
+    "inner_rank": 64,
+    "num_tokens": 128,
+    "convffn_kernel_size": 5,
+    "mlp_ratio": 2.0,
+    "upscale": 2,
+    "img_range": 1.0,
+    "upsampler": "pixelshuffle",
+    "resi_connection": "1conv",
+}
+
+MAMBAIRV2_X2_CONFIGS = {
+    "light": MAMBAIRV2_LIGHT_X2_CONFIG,
+    "base": MAMBAIRV2_BASE_X2_CONFIG,
+}
+
 
 def _strip_module_prefix(state_dict):
     if state_dict and all(key.startswith("module.") for key in state_dict):
@@ -53,13 +77,17 @@ def extract_model_state(checkpoint):
     return _strip_module_prefix(checkpoint)
 
 
-def build_official_mambairv2_light(
+def build_official_mambairv2(
     repo_path: str,
+    variant: str = "base",
     config: Optional[Dict[str, Any]] = None,
 ) -> nn.Module:
-    """Build MambaIRv2-Light from a checkout of the authors' official repo."""
+    """Build an official MambaIRv2 x2 variant from the authors' repository."""
+    if variant not in MAMBAIRV2_X2_CONFIGS:
+        raise ValueError(f"MambaIRv2 variant must be one of {sorted(MAMBAIRV2_X2_CONFIGS)}, got '{variant}'")
     repo_path = os.path.abspath(os.path.expanduser(repo_path)) if repo_path else ""
-    architecture_file = os.path.join(repo_path, "basicsr", "archs", "mambairv2light_arch.py")
+    architecture_module = "mambairv2light_arch" if variant == "light" else "mambairv2_arch"
+    architecture_file = os.path.join(repo_path, "basicsr", "archs", f"{architecture_module}.py")
     if not repo_path or not os.path.isfile(architecture_file):
         raise FileNotFoundError(
             "MambaIRv2 checkout not found. Clone https://github.com/csguoh/MambaIR "
@@ -68,16 +96,29 @@ def build_official_mambairv2_light(
     if repo_path not in sys.path:
         sys.path.insert(0, repo_path)
     try:
-        from basicsr.archs.mambairv2light_arch import MambaIRv2Light
+        if variant == "light":
+            from basicsr.archs.mambairv2light_arch import MambaIRv2Light
+            model_class = MambaIRv2Light
+        else:
+            from basicsr.archs.mambairv2_arch import MambaIRv2
+            model_class = MambaIRv2
     except Exception as exc:
         raise RuntimeError(
-            "Could not import official MambaIRv2-Light. Install the MambaIR "
+            f"Could not import official MambaIRv2-{variant}. Install the MambaIR "
             "requirements, including a causal_conv1d/mamba_ssm build compatible "
             "with the active PyTorch and CUDA versions."
         ) from exc
 
-    resolved_config = {**MAMBAIRV2_LIGHT_X2_CONFIG, **(config or {})}
-    return MambaIRv2Light(**resolved_config)
+    resolved_config = {**MAMBAIRV2_X2_CONFIGS[variant], **(config or {})}
+    return model_class(**resolved_config)
+
+
+def build_official_mambairv2_light(
+    repo_path: str,
+    config: Optional[Dict[str, Any]] = None,
+) -> nn.Module:
+    """Backward-compatible helper for existing Light experiment callers."""
+    return build_official_mambairv2(repo_path, variant="light", config=config)
 
 
 class GrayscaleMambaIRv2(nn.Module):
@@ -205,14 +246,19 @@ def build_model_from_checkpoint(checkpoint, scale_factor=2, mambair_repo=""):
     missing = required - set(config)
     if missing:
         raise ValueError(f"Fusion checkpoint is missing config keys: {sorted(missing)}")
-    if config["global_backend"] != "mambairv2_light":
+    supported_backends = {"mambairv2_light": "light", "mambairv2_base": "base"}
+    if config["global_backend"] not in supported_backends:
         raise ValueError(f"Unsupported global backend: {config['global_backend']}")
 
     local_config = resolve_nafnet_config(
         {"model_config": config["local_config"]},
         scale_factor=scale_factor,
     )
-    global_backbone = build_official_mambairv2_light(mambair_repo, config["global_config"])
+    global_backbone = build_official_mambairv2(
+        mambair_repo,
+        variant=supported_backends[config["global_backend"]],
+        config=config["global_config"],
+    )
     model = GlobalLocalFusionSR(
         NAFNetSR(**local_config),
         GrayscaleMambaIRv2(global_backbone),

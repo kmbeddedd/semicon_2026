@@ -315,18 +315,18 @@ def parse_args():
 
 def auto_detect_dataset_paths(args):
     """
-    Automatically detects and resolves training and validation paths on Kaggle, Colab, or local disks.
-    If zip archives are found in /kaggle/input/ or current directory, extracts them automatically.
+    Automatically detect training and validation paths on Colab or local disks.
+    If suitable zip archives are found, extract them into the local data directory.
     """
     import zipfile
 
     if os.path.exists(args.train_input) and os.path.exists(args.train_target):
         return ensure_validation_split(args)
 
-    print("[Dataset Auto-Detect] Checking /kaggle/input, /content, and local directories...")
+    print("[Dataset Auto-Detect] Checking /content and local directories...")
 
-    # Check for zip files in dataset/ or /kaggle/input/ or root
-    search_dirs = ["dataset", "/kaggle/input", "/kaggle/working", "/content", "data", "."]
+    # Prefer Colab's local disk so cloud-drive I/O does not starve the GPU.
+    search_dirs = ["dataset", "/content", "data", "."]
     for s_dir in search_dirs:
         if os.path.exists(s_dir):
             for z in sorted(glob.glob(os.path.join(s_dir, "**/*.zip"), recursive=True)):
@@ -341,7 +341,7 @@ def auto_detect_dataset_paths(args):
 
     # Search for NoisyLR and GT directories anywhere
     candidate_lr, candidate_gt = [], []
-    for s_dir in ["data", "/kaggle/input", "/content", "."]:
+    for s_dir in ["data", "/content", "."]:
         if os.path.exists(s_dir):
             for root, dirs, _ in os.walk(s_dir):
                 for d in dirs:
@@ -457,7 +457,7 @@ def main():
     ema = ModelEMA(raw_model, decay=args.ema_decay)
 
     if torch.cuda.device_count() > 1:
-        print(f"[Metrology Training] Multi-GPU Detected: Distributing across {torch.cuda.device_count()} GPUs (T4 x2) with DataParallel!")
+        print(f"[Metrology Training] Multi-GPU detected: distributing across {torch.cuda.device_count()} GPUs with DataParallel.")
         model = torch.nn.DataParallel(raw_model)
     else:
         model = raw_model

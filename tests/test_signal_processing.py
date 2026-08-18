@@ -16,7 +16,12 @@ from utils.signal_analysis import (
 )
 from utils.losses import MetrologyLoss, FFTLoss, SSIMLoss, SobelEdgeLoss, CharbonnierLoss, BetaGaussianNLLLoss
 from models.nafnet import NAFNetSR
-from models.fusion import GlobalLocalFusionSR
+from models.fusion import (
+    MAMBAIRV2_BASE_X2_CONFIG,
+    MAMBAIRV2_LIGHT_X2_CONFIG,
+    GlobalLocalFusionSR,
+    build_official_mambairv2,
+)
 from utils.dataset import PairedSemiconDataset
 from train import warmup_cosine_factor, psnr_polish_weights, load_model_state_strict, load_model_state_for_extension, atomic_torch_save, ensure_validation_split
 from eval import predict_tta_batched
@@ -110,6 +115,15 @@ class TestSignalProcessing(unittest.TestCase):
         self.assertTrue(torch.equal(base_out, extended_out))
 
     def test_global_local_fusion_is_identity_safe_and_trainable(self):
+        self.assertEqual(MAMBAIRV2_BASE_X2_CONFIG["embed_dim"], 174)
+        self.assertEqual(MAMBAIRV2_BASE_X2_CONFIG["depths"], (6, 6, 6, 6, 6, 6))
+        self.assertEqual(MAMBAIRV2_BASE_X2_CONFIG["d_state"], 16)
+        self.assertEqual(MAMBAIRV2_BASE_X2_CONFIG["num_tokens"], 128)
+        self.assertEqual(MAMBAIRV2_BASE_X2_CONFIG["upsampler"], "pixelshuffle")
+        self.assertEqual(MAMBAIRV2_LIGHT_X2_CONFIG["embed_dim"], 48)
+        with self.assertRaises(ValueError):
+            build_official_mambairv2("", variant="unknown")
+
         class DummyGlobal(torch.nn.Module):
             def forward(self, value):
                 return torch.zeros(

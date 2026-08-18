@@ -1,6 +1,6 @@
 # SemiCon Restore: Research NAFNet-SR for Semiconductor Inspection
 
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kmbeddedd/semicon_2026/blob/Kunal/train_colab.ipynb)
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kmbeddedd/semicon_2026/blob/Kunal/train_fusion_colab.ipynb)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0%2B-orange.svg)](https://pytorch.org/)
 [![Tests](https://img.shields.io/badge/tests-19%2F19%20passing-brightgreen.svg)](#robustness-and-verification)
@@ -15,13 +15,13 @@ The verified solution combines a lightweight NAFNet backbone, a physical bicubic
 |---|---|
 | **What is the problem?** | Joint denoising and 2× super-resolution of low-dose semiconductor inspection images. |
 | **What is the input/output?** | One grayscale `128×128` degraded image → one restored `256×256` image in physical `[0,1]` intensity range. |
-| **What was built?** | A 10.23M-parameter Research NAFNet-SR, complete training/evaluation pipeline, Google Colab and Kaggle workflows, and a verified checkpoint. |
+| **What was built?** | A 10.23M-parameter Research NAFNet-SR, complete training/evaluation pipeline, Google Colab workflows, and a verified checkpoint. |
 | **What is novel here?** | Identity-safe transfer from a proven residual model into a gated **2D local/FFT bottleneck mixer**, plus a beta-NLL uncertainty head used as auxiliary supervision. |
 | **Best verified result** | **28.83964 dB PSNR** with 8-fold TTA across all 320 validation pairs. |
 | **Improvement over the prior model** | **+0.03406 dB PSNR with TTA**, improving 286/320 paired validation images. |
 | **Speed** | 14.05 ms/image without TTA (71.2 images/s) or 145.55 ms/image with maximum-accuracy TTA on an RTX 2050. |
 | **Reproducibility** | Seeded training, self-describing checkpoints, strict state loading, atomic saves, 19 automated tests, and full-dataset evaluation. |
-| **Next experiment** | Official MambaIRv2-Light global branch + NAFNet local branch, spatial uncertainty-guided fusion, ADD+, then pure-MSE polish. This is implemented but not yet claimed as an improvement. |
+| **Next experiment** | Official full MambaIRv2 Base global branch + NAFNet local branch, spatial uncertainty-guided fusion, ADD+, then pure-MSE polish. This is implemented but not yet claimed as an improvement. |
 
 ## Why this solution stands out
 
@@ -29,7 +29,7 @@ The verified solution combines a lightweight NAFNet backbone, a physical bicubic
 2. **Spatial and frequency reasoning** — local depthwise convolution captures edges and line patterns while a 2D FFT path supplies global periodic context at the bottleneck.
 3. **Uncertainty-aware optimization** — a per-pixel variance head and beta-NLL auxiliary loss emphasize difficult regions without using stochastic inference.
 4. **Evidence before claims** — every headline number is reproduced on all 320 held-out pairs; the README also reports metric regressions and clean-input limitations.
-5. **Practical delivery** — FP16, TorchScript, batched inference, D4 TTA, Google Drive resume support, dual-GPU training, and both `.npy` and preview `.png` outputs are included.
+5. **Practical delivery** — FP16, TorchScript, batched inference, D4 TTA, Google Drive resume support, and both `.npy` and preview `.png` outputs are included.
 
 ### Technology stack
 
@@ -39,7 +39,7 @@ The verified solution combines a lightweight NAFNet backbone, a physical bicubic
 | Image and signal analysis | NumPy, OpenCV, PyWavelets, SciPy, scikit-image |
 | Quality measurement | PSNR, SSIM, LPIPS, Wavelet-MAD, clean-input audit |
 | Acceleration | CUDA, AMP FP16, channels-last tensors, TorchScript, batched D4 TTA |
-| Experiment delivery | Google Colab, Google Drive resume, Kaggle dual-GPU, Git LFS |
+| Experiment delivery | Google Colab, Google Drive resume, automatic VRAM tuning, Git LFS |
 
 ## Verified results
 
@@ -114,7 +114,7 @@ The new research path in `train_fusion.py` combines two complementary restorers:
 ```mermaid
 flowchart LR
     A[Noisy 128x128 input] --> L[Accepted NAFNet local/detail branch]
-    A --> M[Official MambaIRv2-Light global branch]
+    A --> M[Official full MambaIRv2 Base global branch]
     L --> U[Local uncertainty map]
     L --> F[Spatial fusion gate]
     M --> F
@@ -123,7 +123,8 @@ flowchart LR
 ```
 
 - The local branch begins from the accepted semiconductor checkpoint.
-- The global branch is the authors' official MambaIRv2-Light x2 architecture and pretrained state; its source is not copied into this repository.
+- The default global branch follows the authors' [official full MambaIRv2 Base x2 preset](https://github.com/csguoh/MambaIR/blob/main/options/train/mambairv2/train_MambaIRv2_SR_x2.yml) and pretrained state exactly: 174 channels, six groups of six blocks, state dimension 16, and 128 semantic tokens. Its source is not copied into this repository.
+- The original 48-channel Light branch remains available with `--mambair_variant light` for a lower-memory ablation.
 - A small spatial gate sees the local prediction, global prediction, their absolute disagreement, and the local uncertainty cue.
 - The gate's last projection is exactly zero-initialized. At step zero, the fused output is bit-identical to NAFNet, regardless of the MambaIRv2 prediction.
 - Fusion checkpoints record `model_type`, both architecture configurations, all branch weights, and freeze policy. `eval.py` reconstructs them strictly when `--mambair_repo` is supplied.
@@ -212,7 +213,7 @@ pip install -r requirements.txt
 ```
 
 ```bash
-# Linux, macOS, Colab, or Kaggle
+# Linux, macOS, or Colab
 source venv/bin/activate
 pip install -r requirements.txt
 ```
@@ -313,18 +314,19 @@ The accepted PSNR is loaded as the threshold, so `best_model.pt` is replaced onl
 
 ### Run the MambaIRv2 fusion experiment
 
-The simplest path is [train_fusion_colab.ipynb](train_fusion_colab.ipynb). It clones the official MambaIR repository, downloads the authors' x2 lightweight checkpoint, runs an ADD+ fusion stage, then resumes with D4-only MSE polishing. To launch the same workflow manually:
+The simplest path is [train_fusion_colab.ipynb](train_fusion_colab.ipynb). It clones the official MambaIR repository, downloads the authors' 92.8 MB full Base x2 checkpoint, runs an ADD+ fusion stage, then resumes with D4-only MSE polishing. To launch the same workflow manually:
 
 ```bash
 git clone --depth 1 https://github.com/csguoh/MambaIR.git /content/MambaIR
-wget https://github.com/csguoh/MambaIR/releases/download/v1.0/mambairv2_lightSR_x2.pth \
-  -O /content/mambairv2_lightSR_x2.pth
+wget https://github.com/csguoh/MambaIR/releases/download/v1.0/mambairv2_classicSR_Base_x2.pth \
+  -O /content/mambairv2_classicSR_Base_x2.pth
 
 python train_fusion.py \
   --mambair_repo /content/MambaIR \
+  --mambair_variant base \
   --local_weights weights/best_model.pt \
-  --global_weights /content/mambairv2_lightSR_x2.pth \
-  --save_dir /content/drive/MyDrive/semicon_mambair_fusion \
+  --global_weights /content/mambairv2_classicSR_Base_x2.pth \
+  --save_dir /content/drive/MyDrive/semicon_mambair_base_fusion \
   --epochs 12 \
   --augmentation add_plus \
   --add_probability 0.5 \
@@ -333,8 +335,8 @@ python train_fusion.py \
   --local_lr 2e-6 \
   --fusion_lr 2e-5 \
   --auto_batch_size \
-  --target_vram_fraction 0.85 \
-  --max_batch_size 24 \
+  --target_vram_fraction 0.82 \
+  --max_batch_size 8 \
   --num_workers 2 \
   --no_cache
 ```
@@ -351,10 +353,10 @@ python eval.py \
   --weights weights/fusion_experiment/best_model.pt \
   --mambair_repo /content/MambaIR \
   --scale 2 \
-  --batch_size 2
+  --batch_size 1
 ```
 
-MambaIRv2 requires compiled `mamba_ssm` and `causal_conv1d` packages compatible with the active PyTorch/CUDA build. Keep these optional dependencies out of the base environment when using only NAFNet.
+MambaIRv2 requires compiled `mamba_ssm` and `causal_conv1d` packages compatible with the active PyTorch/CUDA build. The full Base branch is substantially heavier than Light, so the notebook freezes it and starts with a conservative T4 memory budget. Keep these optional dependencies out of the base environment when using only NAFNet.
 
 `--auto_batch_size` executes the real full-resolution AMP forward, loss, and backward path, then binary-searches for the largest even batch inside the requested CUDA budget. On a 15 GiB Colab T4, `0.88` is expected to reserve roughly 13 GiB while retaining workspace headroom. Each epoch reports peak allocated, reserved, and total VRAM. Targeting 100% is intentionally unsupported because allocator variation and cuDNN/cuFFT workspaces can otherwise trigger an OOM after training has started.
 
@@ -372,15 +374,14 @@ python train.py --resume weights/latest_model.pt --epochs 30 --batch_size 8 --lr
 python train.py --epochs 100 --batch_size 16 --lr 5e-4 --warmup_epochs 5 --scale 2
 ```
 
-Training includes AdamW, warmup plus cosine decay, AMP FP16, gradient clipping, EMA tracking, differential extension learning rates, deterministic seeding, multi-GPU `DataParallel`, and atomic checkpoint replacement.
+Training includes AdamW, warmup plus cosine decay, AMP FP16, gradient clipping, EMA tracking, differential extension learning rates, deterministic seeding, and atomic checkpoint replacement.
 
 For ablations, use `--no-spectral_mixer` and/or `--no-uncertainty_head`.
 
 ### Cloud workflows
 
-- **Google Colab:** [train_colab.ipynb](train_colab.ipynb) auto-fills approximately 88% of the available GPU VRAM, uses local-disk workers, writes checkpoints to Google Drive, and performs final TTA inference.
-- **Fusion Colab:** [train_fusion_colab.ipynb](train_fusion_colab.ipynb) installs the official MambaIRv2 dependency and runs the isolated ADD+ then D4/MSE experiment.
-- **Kaggle:** [train_kaggle.ipynb](train_kaggle.ipynb) extracts the canonical archives and supports dual-T4 `DataParallel` training.
+- **Accepted NAFNet Colab:** [train_colab.ipynb](train_colab.ipynb) is the NAFNet-only workflow. It auto-fills approximately 88% of GPU VRAM, writes checkpoints to Google Drive, and performs final TTA inference.
+- **Full MambaIRv2 Base Fusion Colab:** [train_fusion_colab.ipynb](train_fusion_colab.ipynb) installs the official dependency and runs the isolated ADD+ then D4/MSE experiment. Use this notebook when MambaIRv2 is required.
 
 ## Robustness and verification
 
@@ -451,9 +452,8 @@ semicon_2026/
 ├── train.py                  # AMP/EMA training and checkpoint engine
 ├── train_fusion.py           # Global/local fusion experiment and PSNR polish
 ├── eval.py                   # FP16/JIT/TTA inference and full metrics
-├── train_colab.ipynb         # Single-GPU, Drive-resumable workflow
-├── train_fusion_colab.ipynb  # Two-stage MambaIRv2 fusion workflow
-├── train_kaggle.ipynb        # Dual-GPU workflow
+├── train_colab.ipynb         # NAFNet-only Colab workflow
+├── train_fusion_colab.ipynb  # Full MambaIRv2 Base Colab workflow
 ├── train.zip                 # Canonical paired training archive via Git LFS
 └── Test_NoisyLR.zip          # Canonical hidden-test archive via Git LFS
 ```
@@ -467,7 +467,7 @@ Generated data, virtual environments, caches, and resumable optimizer checkpoint
 3. **External generalization:** the available evidence is from the supplied distribution and seeded perturbations; no independent microscope/tool dataset is included.
 4. **Physical calibration:** the variance regression and Wavelet-MAD values are useful diagnostics, not calibrated sensor parameters or formal bounds.
 5. **TTA cost:** maximum-accuracy inference is roughly 10× slower than the JIT no-TTA path.
-6. **Fusion evidence pending:** the MambaIRv2 branch is implemented as an ablation and has no reported semiconductor PSNR until its Colab run completes. Its compiled selective-scan dependency also makes setup more sensitive to CUDA/PyTorch version changes.
+6. **Fusion evidence pending:** the full MambaIRv2 Base branch is implemented as an ablation and has no reported semiconductor PSNR until its Colab run completes. More capacity does not guarantee a gain after RGB bicubic pretraining is transferred to noisy grayscale metrology; its compiled selective-scan dependency also makes setup more sensitive to CUDA/PyTorch version changes.
 7. **CAM availability:** the ADD authors' public repository currently exposes no implementation. This project supports externally generated CAM masks and otherwise uses a documented coarse saliency proxy, so proxy and true-CAM experiments must be reported separately.
 
 ## References
