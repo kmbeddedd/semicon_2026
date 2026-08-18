@@ -1,6 +1,7 @@
 # SemiCon Restore: Research NAFNet-SR for Semiconductor Inspection
 
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kmbeddedd/semicon_2026/blob/Kunal/train_fusion_colab.ipynb)
+**Official submitted-model training:** [![Open accepted model in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kmbeddedd/semicon_2026/blob/main/train_colab.ipynb)
+
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0%2B-orange.svg)](https://pytorch.org/)
 [![Tests](https://img.shields.io/badge/tests-19%2F19%20passing-brightgreen.svg)](#robustness-and-verification)
@@ -8,6 +9,30 @@
 An end-to-end deep-learning pipeline for the **KLA Challenge PS01**: restore noisy, undersampled semiconductor inspection images while upscaling them from `128×128` to `256×256`.
 
 The verified solution combines a lightweight NAFNet backbone, a physical bicubic residual path, a learned local/FFT feature mixer, uncertainty-aware training, and optional 8-fold test-time augmentation. An isolated experimental track adds identity-safe NAFNet/MambaIRv2 fusion, ADD/ADD+ augmentation, and an MSE PSNR-polish schedule without replacing the accepted checkpoint. It includes training, evaluation, data characterization, cloud notebooks, strict checkpoint loading, and submission-ready NPY/PNG generation.
+
+## Required repository contents
+
+This public repository is organized so a reviewer can clone it and run inference without contacting the authors.
+
+### Files the evaluator should choose
+
+| Task | Use this file | What it does |
+|---|---|---|
+| **Train/reproduce the submitted model** | [`train_colab.ipynb`](train_colab.ipynb) | The only notebook the evaluator needs to open for training; it invokes `train.py` automatically. |
+| **Run final inference/evaluation** | [`eval.py`](eval.py) | The only evaluation entry point; provide `--input_dir` and `--output_dir`. |
+
+The full MambaIRv2 Base implementation is also included for continued research: [`train_fusion_colab.ipynb`](train_fusion_colab.ipynb) is its Colab launcher, [`train_fusion.py`](train_fusion.py) is its trainer, and [`models/fusion.py`](models/fusion.py) contains the fusion model. These experimental files are not needed to reproduce the currently submitted `weights/best_model.pt` or `restored_test_outputs/`.
+
+| # | Required content | Repository artifact | Status |
+|---:|---|---|---|
+| 1 | Complete setup and usage guide | [`README.md`](README.md) | Ready |
+| 2 | Standalone evaluation script | [`eval.py`](eval.py) | Ready; requires only input and output directory arguments |
+| 3 | Reproducible training workflow | [`train_colab.ipynb`](train_colab.ipynb) | Ready; invokes the underlying `train.py` implementation |
+| 4 | Final trained model | [`weights/best_model.pt`](weights/best_model.pt) | Ready; 41.05 MB self-describing PyTorch checkpoint |
+| 5 | Restored test outputs | [`restored_test_outputs/`](restored_test_outputs/) | Ready; 400 NPY predictions and 400 PNG previews |
+| 6 | Frozen Python environment | [`requirements.txt`](requirements.txt) | Ready; pinned direct and transitive packages |
+
+The accepted checkpoint and restored test outputs are the verified NAFNet research model. The full MambaIRv2 Base fusion path is clearly isolated as an unverified experiment and is not substituted for the final model unless it beats the accepted validation PSNR.
 
 ## 60-second judge overview
 
@@ -197,7 +222,7 @@ python characterize_data.py \
 Git LFS is required for the dataset archives.
 
 ```bash
-git clone -b Kunal https://github.com/kmbeddedd/semicon_2026.git
+git clone https://github.com/kmbeddedd/semicon_2026.git
 cd semicon_2026
 git lfs pull
 
@@ -218,7 +243,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-`requirements-verified.txt` records the direct dependency versions used for the reproduced RTX 2050 benchmark. Install a PyTorch build appropriate for the available CUDA runtime.
+`requirements.txt` records the pinned direct and transitive environment used to reproduce the RTX 2050 evaluation. If the host needs a different CUDA runtime, install the matching PyTorch wheel first and then install the remaining pinned packages.
 
 ### 2. Extract the canonical datasets
 
@@ -243,6 +268,8 @@ python eval.py \
 ```
 
 Each NPY input produces a restored `.npy` array and an 8-bit `_restored.png` preview.
+
+The committed [`restored_test_outputs/`](restored_test_outputs/) directory was produced with this maximum-accuracy path for all 400 hidden-test inputs. The NPY arrays are the authoritative numerical outputs; PNG files are previews.
 
 ### 4. Run fast inference without TTA
 
@@ -282,9 +309,9 @@ python eval.py \
 
 The evaluator reports restored and bicubic PSNR/SSIM/LPIPS, synchronized GPU latency, the Wavelet-MAD estimate, and optionally clean-input degradation.
 
-## Training
+## Official submitted-model training — use `train_colab.ipynb`
 
-The research mixer and uncertainty head are enabled by default.
+For Google Colab training, open [`train_colab.ipynb`](train_colab.ipynb). It is the official submitted-model training entry point and runs `train.py` with the research mixer and uncertainty head enabled.
 
 ### Continue from the accepted checkpoint
 
@@ -312,9 +339,9 @@ The accepted PSNR is loaded as the threshold, so `best_model.pt` is replaced onl
 
 `d4` deliberately disables the legacy CutBlur and Gaussian jitter during this PSNR-focused run. Over the final five epochs, the trainer transitions from the original composite objective to pure MSE.
 
-### Run the MambaIRv2 fusion experiment
+### Included MambaIRv2 Base scripts — experimental
 
-The simplest path is [train_fusion_colab.ipynb](train_fusion_colab.ipynb). It clones the official MambaIR repository, downloads the authors' 92.8 MB full Base x2 checkpoint, runs an ADD+ fusion stage, then resumes with D4-only MSE polishing. To launch the same workflow manually:
+These scripts are intentionally included, but they do not correspond to the currently submitted checkpoint or restored outputs. The simplest experimental path is [train_fusion_colab.ipynb](train_fusion_colab.ipynb). It clones the official MambaIR repository, downloads the authors' 92.8 MB full Base x2 checkpoint, runs an ADD+ fusion stage, then resumes with D4-only MSE polishing. To launch the same workflow manually:
 
 ```bash
 git clone --depth 1 https://github.com/csguoh/MambaIR.git /content/MambaIR
@@ -378,10 +405,10 @@ Training includes AdamW, warmup plus cosine decay, AMP FP16, gradient clipping, 
 
 For ablations, use `--no-spectral_mixer` and/or `--no-uncertainty_head`.
 
-### Cloud workflows
+### Colab workflows
 
-- **Accepted NAFNet Colab:** [train_colab.ipynb](train_colab.ipynb) is the NAFNet-only workflow. It auto-fills approximately 88% of GPU VRAM, writes checkpoints to Google Drive, and performs final TTA inference.
-- **Full MambaIRv2 Base Fusion Colab:** [train_fusion_colab.ipynb](train_fusion_colab.ipynb) installs the official dependency and runs the isolated ADD+ then D4/MSE experiment. Use this notebook when MambaIRv2 is required.
+- **Official submitted-model training:** [train_colab.ipynb](train_colab.ipynb) is the file evaluators should choose. It auto-fills approximately 88% of GPU VRAM, writes checkpoints to Google Drive, and performs final TTA inference.
+- **Included research experiment:** [train_fusion_colab.ipynb](train_fusion_colab.ipynb) installs the full MambaIRv2 Base dependency and runs the isolated ADD+ then D4/MSE experiment. It is not required for evaluating the submitted checkpoint.
 
 ## Robustness and verification
 
@@ -448,6 +475,7 @@ semicon_2026/
 │   └── test_signal_processing.py
 ├── weights/
 │   └── best_model.pt         # Accepted epoch-8 research checkpoint
+├── restored_test_outputs/    # 400 final NPY outputs + 400 PNG previews
 ├── characterize_data.py      # Empirical degradation and clean-input audit
 ├── train.py                  # AMP/EMA training and checkpoint engine
 ├── train_fusion.py           # Global/local fusion experiment and PSNR polish
