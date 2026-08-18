@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from models.nafnet import NAFNetSR, resolve_nafnet_config
+from models.fusion import build_model_from_checkpoint
 from utils.dataset import robust_percentile_normalize
 from utils.metrics import compute_psnr, compute_ssim, wavelet_noise_sigma, psnr_ceiling, relative_ceiling_efficiency
 
@@ -30,6 +30,12 @@ def parse_args():
     parser.add_argument("--output_dir", "-o", type=str, required=True, help="Path to output directory for restored images")
     parser.add_argument("--target_dir", "-t", type=str, default=None, help="Optional Ground Truth directory to compute benchmark PSNR/SSIM/LPIPS")
     parser.add_argument("--weights", "-w", type=str, default="weights/best_model.pt", help="Path to trained model checkpoint (.pt)")
+    parser.add_argument(
+        "--mambair_repo",
+        type=str,
+        default="",
+        help="Official MambaIR checkout; required only by global/local fusion checkpoints",
+    )
     parser.add_argument("--scale", type=int, default=2, help="Scale factor (1 for denoising, 2 for 2x super-resolution)")
     parser.add_argument("--batch_size", "-b", type=int, default=8, help="Batch size for parallel GPU inference (1 for streaming)")
     parser.add_argument("--num_workers", type=int, default=2, help="DataLoader workers for async disk prefetching")
@@ -119,12 +125,20 @@ def main():
     print(f"[Metrology Eval] Loading checkpoint: {weights_path}")
     checkpoint = torch.load(weights_path, map_location=device)
     state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
-    model_config = resolve_nafnet_config(checkpoint, scale_factor=args.scale)
-    checkpoint_scale = model_config["scale_factor"]
+    base_model, model_config, model_type = build_model_from_checkpoint(
+        checkpoint,
+        scale_factor=args.scale,
+        mambair_repo=args.mambair_repo,
+    )
+    checkpoint_scale = (
+        model_config["local_config"]["scale_factor"]
+        if model_type == "global_local_fusion"
+        else model_config["scale_factor"]
+    )
     if int(checkpoint_scale) != args.scale:
         raise ValueError(f"Checkpoint was trained for scale={checkpoint_scale}, but --scale={args.scale} was requested.")
 
-    base_model = NAFNetSR(**model_config).to(device)
+    base_model = base_model.to(device)
     load_model_state_strict(base_model, state_dict)
 
     base_model.eval()
@@ -156,7 +170,11 @@ def main():
             print(f"[Metrology Eval] JIT trace fallback to eager model: {e}")
             model = base_model
 
-    print(f"[Metrology Eval] Acceleration Settings -> FP16 Tensor Cores: {use_fp16} | JIT Fusion: {use_jit and (not use_tta)} | Batch Size: {args.batch_size} | 8-Fold TTA: {use_tta}")
+    print(
+        f"[Metrology Eval] Model: {model_type} | FP16 Tensor Cores: {use_fp16} | "
+        f"JIT Fusion: {use_jit and (not use_tta)} | Batch Size: {args.batch_size} | "
+        f"8-Fold TTA: {use_tta}"
+    )
 
     # LPIPS Perceptual Evaluator Setup
     lpips_fn = None

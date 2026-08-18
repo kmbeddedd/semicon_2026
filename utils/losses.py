@@ -127,7 +127,16 @@ class MetrologyLoss(nn.Module):
     Combines Charbonnier (pixel fidelity), calibrated Sobel (boundary roughness),
     Ortho-2D FFT (frequency speckle), and MS-SSIM (structural patterns).
     """
-    def __init__(self, w_charb=1.0, w_edge=0.05, w_fft=0.05, w_ssim=0.2, w_nll=0.0, nll_beta=0.5):
+    def __init__(
+        self,
+        w_mse=0.0,
+        w_charb=1.0,
+        w_edge=0.05,
+        w_fft=0.05,
+        w_ssim=0.2,
+        w_nll=0.0,
+        nll_beta=0.5,
+    ):
         super().__init__()
         self.charbonnier = CharbonnierLoss()
         self.edge = SobelEdgeLoss()
@@ -135,36 +144,75 @@ class MetrologyLoss(nn.Module):
         self.ssim = SSIMLoss()
         self.nll = BetaGaussianNLLLoss(beta=nll_beta)
 
-        self.w_charb = w_charb
-        self.w_edge = w_edge
-        self.w_fft = w_fft
-        self.w_ssim = w_ssim
-        self.w_nll = w_nll
+        self.set_weights(
+            mse=w_mse,
+            charb=w_charb,
+            edge=w_edge,
+            fft=w_fft,
+            ssim=w_ssim,
+            nll=w_nll,
+        )
+
+    def set_weights(self, *, mse, charb, edge, fft, ssim, nll):
+        """Update loss weights without rebuilding the criterion or optimizer."""
+        weights = {
+            "mse": mse,
+            "charb": charb,
+            "edge": edge,
+            "fft": fft,
+            "ssim": ssim,
+            "nll": nll,
+        }
+        if any(value < 0 for value in weights.values()):
+            raise ValueError("Loss weights must be non-negative")
+        if not any(value > 0 for value in weights.values()):
+            raise ValueError("At least one loss weight must be positive")
+        self.w_mse = float(mse)
+        self.w_charb = float(charb)
+        self.w_edge = float(edge)
+        self.w_fft = float(fft)
+        self.w_ssim = float(ssim)
+        self.w_nll = float(nll)
+
+    @property
+    def weights(self):
+        return {
+            "mse": self.w_mse,
+            "charb": self.w_charb,
+            "edge": self.w_edge,
+            "fft": self.w_fft,
+            "ssim": self.w_ssim,
+            "nll": self.w_nll,
+        }
 
     def forward(self, pred, target, raw_variance=None):
         # Loss evaluation stays in FP32 even when the model forward pass uses AMP.
         with torch.autocast(device_type=pred.device.type, enabled=False):
             pred_f32 = pred.float()
             target_f32 = target.float()
-            l_charb = self.charbonnier(pred_f32, target_f32)
-            l_edge = self.edge(pred_f32, target_f32)
-            l_fft = self.fft(pred_f32, target_f32)
-            l_ssim = self.ssim(pred_f32, target_f32)
+            zero = pred_f32.new_zeros(())
+            l_mse = F.mse_loss(pred_f32, target_f32) if self.w_mse > 0 else zero
+            l_charb = self.charbonnier(pred_f32, target_f32) if self.w_charb > 0 else zero
+            l_edge = self.edge(pred_f32, target_f32) if self.w_edge > 0 else zero
+            l_fft = self.fft(pred_f32, target_f32) if self.w_fft > 0 else zero
+            l_ssim = self.ssim(pred_f32, target_f32) if self.w_ssim > 0 else zero
             if self.w_nll > 0:
                 if raw_variance is None:
                     raise ValueError("raw_variance is required when w_nll > 0")
                 l_nll = self.nll(pred_f32, target_f32, raw_variance.float())
             else:
-                l_nll = pred_f32.new_zeros(())
+                l_nll = zero
 
             total = (
-                self.w_charb * l_charb
+                self.w_mse * l_mse
+                + self.w_charb * l_charb
                 + self.w_edge * l_edge
                 + self.w_fft * l_fft
                 + self.w_ssim * l_ssim
                 + self.w_nll * l_nll
             )
         return total, {
+            "mse": float(l_mse.item()),
             "charb": float(l_charb.item()),
             "edge": float(l_edge.item()),
             "fft": float(l_fft.item()),

@@ -6,6 +6,7 @@ env/
 # Datasets directory (extracted files)
 data/
 datasets/
+MambaIR/
 
 # Model Checkpoints & Weights (ignore large checkpoints, but track best_model.pt < 100MB)
 weights/*.pt
@@ -13,6 +14,7 @@ weights/*.pt
 best_model.pt
 weights/*.onnx
 weights/*.bin
+mambairv2_*.pth
 
 # Python Bytecode & Cache
 __pycache__/

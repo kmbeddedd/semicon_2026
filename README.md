@@ -3,11 +3,11 @@
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kmbeddedd/semicon_2026/blob/Kunal/train_colab.ipynb)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0%2B-orange.svg)](https://pytorch.org/)
-[![Tests](https://img.shields.io/badge/tests-16%2F16%20passing-brightgreen.svg)](#robustness-and-verification)
+[![Tests](https://img.shields.io/badge/tests-19%2F19%20passing-brightgreen.svg)](#robustness-and-verification)
 
 An end-to-end deep-learning pipeline for the **KLA Challenge PS01**: restore noisy, undersampled semiconductor inspection images while upscaling them from `128×128` to `256×256`.
 
-The solution combines a lightweight NAFNet backbone, a physical bicubic residual path, a learned local/FFT feature mixer, uncertainty-aware training, and optional 8-fold test-time augmentation. It includes training, evaluation, data characterization, cloud notebooks, strict checkpoint loading, and submission-ready NPY/PNG generation.
+The verified solution combines a lightweight NAFNet backbone, a physical bicubic residual path, a learned local/FFT feature mixer, uncertainty-aware training, and optional 8-fold test-time augmentation. An isolated experimental track adds identity-safe NAFNet/MambaIRv2 fusion, ADD/ADD+ augmentation, and an MSE PSNR-polish schedule without replacing the accepted checkpoint. It includes training, evaluation, data characterization, cloud notebooks, strict checkpoint loading, and submission-ready NPY/PNG generation.
 
 ## 60-second judge overview
 
@@ -20,7 +20,8 @@ The solution combines a lightweight NAFNet backbone, a physical bicubic residual
 | **Best verified result** | **28.83964 dB PSNR** with 8-fold TTA across all 320 validation pairs. |
 | **Improvement over the prior model** | **+0.03406 dB PSNR with TTA**, improving 286/320 paired validation images. |
 | **Speed** | 14.05 ms/image without TTA (71.2 images/s) or 145.55 ms/image with maximum-accuracy TTA on an RTX 2050. |
-| **Reproducibility** | Seeded training, self-describing checkpoints, strict state loading, atomic saves, 16 automated tests, and full-dataset evaluation. |
+| **Reproducibility** | Seeded training, self-describing checkpoints, strict state loading, atomic saves, 19 automated tests, and full-dataset evaluation. |
+| **Next experiment** | Official MambaIRv2-Light global branch + NAFNet local branch, spatial uncertainty-guided fusion, ADD+, then pure-MSE polish. This is implemented but not yet claimed as an improvement. |
 
 ## Why this solution stands out
 
@@ -106,7 +107,36 @@ The FFT path remains FP32 even under AMP/FP16 evaluation to avoid complex-freque
 
 During training, the decoder also predicts raw per-pixel variance. Softplus converts it into a positive variance and beta-NLL supervises difficult or ambiguous regions. Variance weighting is detached to reduce the incentive to inflate uncertainty. Normal inference returns only the deterministic restored image, so the uncertainty head adds no output-side complexity.
 
-### 4. Composite metrology loss
+### 4. Experimental global/local fusion
+
+The new research path in `train_fusion.py` combines two complementary restorers:
+
+```mermaid
+flowchart LR
+    A[Noisy 128x128 input] --> L[Accepted NAFNet local/detail branch]
+    A --> M[Official MambaIRv2-Light global branch]
+    L --> U[Local uncertainty map]
+    L --> F[Spatial fusion gate]
+    M --> F
+    U --> F
+    F --> O[Restored 256x256 output]
+```
+
+- The local branch begins from the accepted semiconductor checkpoint.
+- The global branch is the authors' official MambaIRv2-Light x2 architecture and pretrained state; its source is not copied into this repository.
+- A small spatial gate sees the local prediction, global prediction, their absolute disagreement, and the local uncertainty cue.
+- The gate's last projection is exactly zero-initialized. At step zero, the fused output is bit-identical to NAFNet, regardless of the MambaIRv2 prediction.
+- Fusion checkpoints record `model_type`, both architecture configurations, all branch weights, and freeze policy. `eval.py` reconstructs them strictly when `--mambair_repo` is supplied.
+
+This is an experiment, not a new headline result. `weights/best_model.pt` remains the accepted default until a fusion checkpoint exceeds its full-validation PSNR.
+
+### 5. ADD/ADD+ and PSNR polishing
+
+The dataset now supports `none`, `d4`, `classic`, `add`, and `add_plus` augmentation modes. ADD/ADD+ perform saliency-region mixing at corresponding coordinates in both LR and HR images, preserving the supervised 2x geometry. Precomputed calibrated attribution masks can be passed through `--saliency_dir`. If they are absent, the loader uses a clearly labelled coarse 2x2 proxy based on target gradients and paired degradation residuals; it is not presented as the paper's CAM.
+
+For metric alignment, `MetrologyLoss` now includes exact MSE. `--psnr_polish_epochs N` linearly removes Charbonnier, edge, FFT, SSIM, and beta-NLL terms over the final `N` epochs and finishes on pure MSE, the objective directly corresponding to PSNR. The Colab fusion workflow uses ADD+ first and switches to D4-only data for the final polish stage.
+
+### 6. Composite metrology loss
 
 The accepted training objective is:
 
@@ -269,6 +299,8 @@ python train.py \
   --num_workers 2 \
   --lr 1e-5 \
   --extension_lr_multiplier 1 \
+  --augmentation d4 \
+  --psnr_polish_epochs 5 \
   --w_nll 0.02 \
   --nll_beta 0.5 \
   --no_cache \
@@ -276,6 +308,53 @@ python train.py \
 ```
 
 The accepted PSNR is loaded as the threshold, so `best_model.pt` is replaced only if validation improves. `latest_model.pt` stores the raw model, EMA model, optimizer, scheduler, scaler, epoch, and best score.
+
+`d4` deliberately disables the legacy CutBlur and Gaussian jitter during this PSNR-focused run. Over the final five epochs, the trainer transitions from the original composite objective to pure MSE.
+
+### Run the MambaIRv2 fusion experiment
+
+The simplest path is [train_fusion_colab.ipynb](train_fusion_colab.ipynb). It clones the official MambaIR repository, downloads the authors' x2 lightweight checkpoint, runs an ADD+ fusion stage, then resumes with D4-only MSE polishing. To launch the same workflow manually:
+
+```bash
+git clone --depth 1 https://github.com/csguoh/MambaIR.git /content/MambaIR
+wget https://github.com/csguoh/MambaIR/releases/download/v1.0/mambairv2_lightSR_x2.pth \
+  -O /content/mambairv2_lightSR_x2.pth
+
+python train_fusion.py \
+  --mambair_repo /content/MambaIR \
+  --local_weights weights/best_model.pt \
+  --global_weights /content/mambairv2_lightSR_x2.pth \
+  --save_dir /content/drive/MyDrive/semicon_mambair_fusion \
+  --epochs 12 \
+  --augmentation add_plus \
+  --add_probability 0.5 \
+  --freeze_global \
+  --no-freeze_local \
+  --local_lr 2e-6 \
+  --fusion_lr 2e-5 \
+  --auto_batch_size \
+  --target_vram_fraction 0.85 \
+  --max_batch_size 24 \
+  --num_workers 2 \
+  --no_cache
+```
+
+Resume the saved `latest_model.pt` with `--epochs 20 --augmentation d4 --psnr_polish_epochs 8`. The accepted local PSNR is used as the initial threshold, so a fusion `best_model.pt` is written only after a measured improvement.
+
+Evaluate a winning fusion checkpoint with:
+
+```bash
+python eval.py \
+  --input_dir data/val/NoisyLR \
+  --target_dir data/val/GT \
+  --output_dir data/fusion_val \
+  --weights weights/fusion_experiment/best_model.pt \
+  --mambair_repo /content/MambaIR \
+  --scale 2 \
+  --batch_size 2
+```
+
+MambaIRv2 requires compiled `mamba_ssm` and `causal_conv1d` packages compatible with the active PyTorch/CUDA build. Keep these optional dependencies out of the base environment when using only NAFNet.
 
 `--auto_batch_size` executes the real full-resolution AMP forward, loss, and backward path, then binary-searches for the largest even batch inside the requested CUDA budget. On a 15 GiB Colab T4, `0.88` is expected to reserve roughly 13 GiB while retaining workspace headroom. Each epoch reports peak allocated, reserved, and total VRAM. Targeting 100% is intentionally unsupported because allocator variation and cuDNN/cuFFT workspaces can otherwise trigger an OOM after training has started.
 
@@ -300,6 +379,7 @@ For ablations, use `--no-spectral_mixer` and/or `--no-uncertainty_head`.
 ### Cloud workflows
 
 - **Google Colab:** [train_colab.ipynb](train_colab.ipynb) auto-fills approximately 88% of the available GPU VRAM, uses local-disk workers, writes checkpoints to Google Drive, and performs final TTA inference.
+- **Fusion Colab:** [train_fusion_colab.ipynb](train_fusion_colab.ipynb) installs the official MambaIRv2 dependency and runs the isolated ADD+ then D4/MSE experiment.
 - **Kaggle:** [train_kaggle.ipynb](train_kaggle.ipynb) extracts the canonical archives and supports dual-T4 `DataParallel` training.
 
 ## Robustness and verification
@@ -327,12 +407,14 @@ python utils/generalization.py --weights weights/best_model.pt --num_samples 50 
 python -m unittest discover -s tests -v
 ```
 
-The 16 tests cover:
+The 19 tests cover:
 
 - paired-data validation and deterministic split integrity;
 - VST numerical round trips and wavelet noise estimation;
 - NAFNet output, residual, NoiseGate, and TTA contracts;
 - identity-safe spectral transfer;
+- identity-safe global/local fusion and trainable gate gradients;
+- paired ADD+ geometry and exact pure-MSE polish scheduling;
 - beta-NLL gradients and uncertainty output shapes;
 - FP32 loss safety under AMP;
 - scheduler transition and strict checkpoint loading;
@@ -353,7 +435,8 @@ The 16 tests cover:
 ```text
 semicon_2026/
 ├── models/
-│   └── nafnet.py             # NAFNet-SR, dual-domain mixer, uncertainty head
+│   ├── nafnet.py             # NAFNet-SR, dual-domain mixer, uncertainty head
+│   └── fusion.py             # Official-Mamba adapter and identity-safe fusion gate
 ├── utils/
 │   ├── dataset.py            # Paired loading, validation, caching, augmentation
 │   ├── losses.py             # Charbonnier, Sobel, FFT, SSIM, beta-NLL
@@ -366,8 +449,10 @@ semicon_2026/
 │   └── best_model.pt         # Accepted epoch-8 research checkpoint
 ├── characterize_data.py      # Empirical degradation and clean-input audit
 ├── train.py                  # AMP/EMA training and checkpoint engine
+├── train_fusion.py           # Global/local fusion experiment and PSNR polish
 ├── eval.py                   # FP16/JIT/TTA inference and full metrics
 ├── train_colab.ipynb         # Single-GPU, Drive-resumable workflow
+├── train_fusion_colab.ipynb  # Two-stage MambaIRv2 fusion workflow
 ├── train_kaggle.ipynb        # Dual-GPU workflow
 ├── train.zip                 # Canonical paired training archive via Git LFS
 └── Test_NoisyLR.zip          # Canonical hidden-test archive via Git LFS
@@ -382,12 +467,17 @@ Generated data, virtual environments, caches, and resumable optimizer checkpoint
 3. **External generalization:** the available evidence is from the supplied distribution and seeded perturbations; no independent microscope/tool dataset is included.
 4. **Physical calibration:** the variance regression and Wavelet-MAD values are useful diagnostics, not calibrated sensor parameters or formal bounds.
 5. **TTA cost:** maximum-accuracy inference is roughly 10× slower than the JIT no-TTA path.
+6. **Fusion evidence pending:** the MambaIRv2 branch is implemented as an ablation and has no reported semiconductor PSNR until its Colab run completes. Its compiled selective-scan dependency also makes setup more sensitive to CUDA/PyTorch version changes.
+7. **CAM availability:** the ADD authors' public repository currently exposes no implementation. This project supports externally generated CAM masks and otherwise uses a documented coarse saliency proxy, so proxy and true-CAM experiments must be reported separately.
 
 ## References
 
 1. Chen et al., *Simple Baselines for Image Restoration*, ECCV 2022 — NAFNet.
 2. Seitzer et al., *On the Pitfalls of Heteroscedastic Uncertainty Estimation with Probabilistic Neural Networks*, ICLR 2022 — beta-NLL.
 3. Donoho and Johnstone, *Ideal Spatial Adaptation by Wavelet Shrinkage*, Biometrika 1994 — robust wavelet noise estimation.
+4. Guo et al., [*MambaIRv2: Attentive State Space Restoration*](https://github.com/csguoh/MambaIR), CVPR 2025 — official global restoration branch and pretrained x2 model.
+5. Mi and Yang, [*ADD: Attribution-Driven Data Augmentation Framework for Boosting Image Super-Resolution*](https://openaccess.thecvf.com/content/CVPR2025/html/Mi_ADD_Attribution-Driven_Data_Augmentation_Framework_for_Boosting_Image_Super-Resolution_CVPR_2025_paper.html), CVPR 2025 — CAM, ADD, and ADD+.
+6. Ren et al., [*The Fourth Challenge on Image Super-Resolution (×4) at NTIRE 2026*](https://arxiv.org/abs/2604.14558), CVPRW 2026 — recent evidence for complementary global/detail branches with spatial fusion.
 
 ---
 

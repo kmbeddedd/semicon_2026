@@ -16,8 +16,9 @@ from utils.signal_analysis import (
 )
 from utils.losses import MetrologyLoss, FFTLoss, SSIMLoss, SobelEdgeLoss, CharbonnierLoss, BetaGaussianNLLLoss
 from models.nafnet import NAFNetSR
+from models.fusion import GlobalLocalFusionSR
 from utils.dataset import PairedSemiconDataset
-from train import warmup_cosine_factor, load_model_state_strict, load_model_state_for_extension, atomic_torch_save, ensure_validation_split
+from train import warmup_cosine_factor, psnr_polish_weights, load_model_state_strict, load_model_state_for_extension, atomic_torch_save, ensure_validation_split
 from eval import predict_tta_batched
 
 class TestSignalProcessing(unittest.TestCase):
@@ -108,6 +109,44 @@ class TestSignalProcessing(unittest.TestCase):
             extended_out = extended(inp)
         self.assertTrue(torch.equal(base_out, extended_out))
 
+    def test_global_local_fusion_is_identity_safe_and_trainable(self):
+        class DummyGlobal(torch.nn.Module):
+            def forward(self, value):
+                return torch.zeros(
+                    value.shape[0],
+                    1,
+                    value.shape[2] * 2,
+                    value.shape[3] * 2,
+                    device=value.device,
+                    dtype=value.dtype,
+                )
+
+        local = NAFNetSR(
+            width=8,
+            enc_blocks=(1,),
+            dec_blocks=(1,),
+            scale_factor=2,
+            predict_uncertainty=True,
+        )
+        fusion = GlobalLocalFusionSR(
+            local,
+            DummyGlobal(),
+            fusion_hidden=8,
+            use_uncertainty=True,
+            freeze_global=True,
+        )
+        inp = torch.rand(1, 1, 8, 8)
+        fusion.eval()
+        with torch.no_grad():
+            expected = local.eval()(inp)
+            actual = fusion(inp)
+        self.assertTrue(torch.equal(expected, actual))
+
+        fusion.train()
+        fusion(inp).mean().backward()
+        self.assertIsNotNone(fusion.fusion_gate[-1].weight.grad)
+        self.assertGreater(fusion.fusion_gate[-1].weight.grad.abs().sum().item(), 0.0)
+
     def test_uncertainty_head_and_beta_nll(self):
         model = NAFNetSR(
             width=8,
@@ -170,6 +209,29 @@ class TestSignalProcessing(unittest.TestCase):
             with self.assertRaises(ValueError):
                 dataset[0]
 
+    def test_add_plus_preserves_paired_geometry(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            input_dir = os.path.join(tmp_dir, "input")
+            target_dir = os.path.join(tmp_dir, "target")
+            os.makedirs(input_dir)
+            os.makedirs(target_dir)
+            for index, value in enumerate((0.0, 1.0)):
+                np.save(os.path.join(input_dir, f"{index}.npy"), np.full((8, 8), value, np.float32))
+                np.save(os.path.join(target_dir, f"{index}.npy"), np.full((16, 16), value, np.float32))
+            dataset = PairedSemiconDataset(
+                input_dir,
+                target_dir,
+                is_train=True,
+                scale_factor=2,
+                cache_in_memory=False,
+                augmentation_mode="add_plus",
+                add_probability=1.0,
+            )
+            np.random.seed(7)
+            inp, target, _ = dataset[0]
+            downsampled_target = torch.nn.functional.avg_pool2d(target.unsqueeze(0), 2).squeeze(0)
+            self.assertTrue(torch.allclose(inp, downsampled_target, atol=1e-6))
+
     def test_validation_split_is_paired_and_non_overlapping(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             train_input = os.path.join(tmp_dir, "train_input")
@@ -225,6 +287,20 @@ class TestSignalProcessing(unittest.TestCase):
         self.assertIsNotNone(pred.grad)
         self.assertFalse(torch.isnan(pred.grad).any())
         self.assertEqual(loss.dtype, torch.float32)
+
+    def test_psnr_polish_reaches_exact_mse(self):
+        base = {"mse": 0.0, "charb": 1.0, "edge": 0.05, "fft": 0.05, "ssim": 0.2, "nll": 0.02}
+        before = psnr_polish_weights(5, total_epochs=10, polish_epochs=3, base_weights=base)
+        final = psnr_polish_weights(10, total_epochs=10, polish_epochs=3, base_weights=base)
+        self.assertEqual(before, base)
+        self.assertEqual(final, {"mse": 1.0, "charb": 0.0, "edge": 0.0, "fft": 0.0, "ssim": 0.0, "nll": 0.0})
+
+        criterion = MetrologyLoss(w_mse=1.0, w_charb=0.0, w_edge=0.0, w_fft=0.0, w_ssim=0.0)
+        pred = torch.rand(1, 1, 8, 8)
+        target = torch.rand_like(pred)
+        loss, parts = criterion(pred, target)
+        self.assertAlmostEqual(loss.item(), torch.nn.functional.mse_loss(pred, target).item(), places=7)
+        self.assertIn("mse", parts)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for the AMP regression test")
     def test_losses_remain_fp32_under_amp(self):

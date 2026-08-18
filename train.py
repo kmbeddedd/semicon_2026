@@ -47,6 +47,24 @@ def warmup_cosine_factor(epoch: int, warmup_epochs: int, total_epochs: int) -> f
     return 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
+def psnr_polish_weights(epoch: int, total_epochs: int, polish_epochs: int, base_weights):
+    """Linearly transition the composite objective to pure MSE at run end."""
+    resolved = dict(base_weights)
+    resolved.setdefault("mse", 0.0)
+    if polish_epochs <= 0 or epoch <= total_epochs - polish_epochs:
+        return resolved
+    polish_step = epoch - (total_epochs - polish_epochs)
+    alpha = min(max(polish_step / float(polish_epochs), 0.0), 1.0)
+    return {
+        "mse": (1.0 - alpha) * resolved["mse"] + alpha,
+        "charb": (1.0 - alpha) * resolved["charb"],
+        "edge": (1.0 - alpha) * resolved["edge"],
+        "fft": (1.0 - alpha) * resolved["fft"],
+        "ssim": (1.0 - alpha) * resolved["ssim"],
+        "nll": (1.0 - alpha) * resolved["nll"],
+    }
+
+
 def load_model_state_strict(model: torch.nn.Module, state_dict):
     """Load raw or DataParallel state dictionaries without silently dropping keys."""
     if state_dict and all(key.startswith("module.") for key in state_dict):
@@ -256,6 +274,14 @@ def parse_args():
     parser.add_argument("--warmup_epochs", type=int, default=5, help="Number of linear warmup epochs")
     parser.add_argument("--scale", type=int, default=2, help="Scale factor (1 for same-res denoising, 2 for SR)")
     parser.add_argument("--patch_size", type=int, default=0, help="Patch size (0 for full 128x128 image)")
+    parser.add_argument(
+        "--augmentation",
+        choices=("none", "d4", "classic", "add", "add_plus"),
+        default="classic",
+        help="Training augmentation recipe; d4 avoids synthetic distribution shift",
+    )
+    parser.add_argument("--add_probability", type=float, default=0.5, help="Probability of ADD/ADD+ paired mixing")
+    parser.add_argument("--saliency_dir", type=str, default="", help="Optional directory of precomputed CAM masks")
     parser.add_argument("--num_workers", type=int, default=2, help="DataLoader workers")
     parser.add_argument("--no_cache", action="store_true", help="Disable in-memory dataset caching to reduce RAM use")
     parser.add_argument("--no_amp", action="store_true", help="Disable Automatic Mixed Precision (AMP)")
@@ -276,6 +302,12 @@ def parse_args():
     )
     parser.add_argument("--w_nll", type=float, default=0.02, help="Beta-NLL auxiliary loss weight when --uncertainty_head is enabled")
     parser.add_argument("--nll_beta", type=float, default=0.5, help="Detached variance weighting exponent for beta-NLL")
+    parser.add_argument(
+        "--psnr_polish_epochs",
+        type=int,
+        default=0,
+        help="Final epochs that linearly anneal the composite loss to pure MSE",
+    )
     parser.add_argument("--extension_lr_multiplier", type=float, default=1.0, help="LR multiplier for spectral/uncertainty modules during transfer training")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducible training")
     parser.add_argument("--deterministic", action="store_true", help="Prefer deterministic kernels over maximum throughput")
@@ -341,6 +373,10 @@ def main():
         raise ValueError("Use either --resume or --init_weights, not both")
     if args.w_nll < 0:
         raise ValueError("--w_nll must be non-negative")
+    if args.psnr_polish_epochs < 0 or args.psnr_polish_epochs > args.epochs:
+        raise ValueError("--psnr_polish_epochs must be between 0 and --epochs")
+    if not 0.0 <= args.add_probability <= 1.0:
+        raise ValueError("--add_probability must be in [0, 1]")
     if args.extension_lr_multiplier <= 0:
         raise ValueError("--extension_lr_multiplier must be positive")
     if args.batch_size < 1:
@@ -369,7 +405,17 @@ def main():
         return
 
     cache_in_memory = not args.no_cache
-    train_ds = PairedSemiconDataset(args.train_input, args.train_target, is_train=True, patch_size=args.patch_size, scale_factor=args.scale, cache_in_memory=cache_in_memory)
+    train_ds = PairedSemiconDataset(
+        args.train_input,
+        args.train_target,
+        is_train=True,
+        patch_size=args.patch_size,
+        scale_factor=args.scale,
+        cache_in_memory=cache_in_memory,
+        augmentation_mode=args.augmentation,
+        add_probability=args.add_probability,
+        saliency_dir=args.saliency_dir,
+    )
     if len(train_ds) == 0:
         print(f"[Metrology Training] ERROR: No valid training image pairs found in '{args.train_input}' and '{args.train_target}'.")
         return
@@ -474,12 +520,21 @@ def main():
             print(f"[Metrology Training] Resumed learning rate: {resume_lrs[0]:.6f}")
 
     # Loss Function (Calibrated Composite Metrology Loss with empirical blur-free weighting)
+    base_loss_weights = {
+        "mse": 0.0,
+        "charb": 1.0,
+        "edge": 0.05,
+        "fft": 0.05,
+        "ssim": 0.2,
+        "nll": args.w_nll if args.uncertainty_head else 0.0,
+    }
     criterion = MetrologyLoss(
+        w_mse=base_loss_weights["mse"],
         w_charb=1.0,
         w_edge=0.05,
         w_fft=0.05,
         w_ssim=0.2,
-        w_nll=args.w_nll if args.uncertainty_head else 0.0,
+        w_nll=base_loss_weights["nll"],
         nll_beta=args.nll_beta,
     ).to(device)
 
@@ -530,12 +585,19 @@ def main():
     )
 
     for epoch in range(start_epoch, args.epochs + 1):
+        epoch_loss_weights = psnr_polish_weights(
+            epoch,
+            args.epochs,
+            args.psnr_polish_epochs,
+            base_loss_weights,
+        )
+        criterion.set_weights(**epoch_loss_weights)
         model.train()
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         epoch_lr = optimizer.param_groups[0]["lr"]
         running_loss = 0.0
-        running_parts = {"charb": 0.0, "edge": 0.0, "fft": 0.0, "ssim": 0.0, "nll": 0.0}
+        running_parts = {"mse": 0.0, "charb": 0.0, "edge": 0.0, "fft": 0.0, "ssim": 0.0, "nll": 0.0}
 
         for inp, tgt, _ in train_loader:
             inp = inp.to(device, non_blocking=True)
@@ -617,7 +679,7 @@ def main():
             )
         print(
             f"Epoch [{epoch:03d}/{args.epochs:03d}] (LR: {epoch_lr:.6f}) - Loss: {avg_loss:.4f} "
-            f"[C:{avg_parts['charb']:.3f}|E:{avg_parts['edge']:.3f}|F:{avg_parts['fft']:.3f}|"
+            f"[M:{avg_parts['mse']:.4f}|C:{avg_parts['charb']:.3f}|E:{avg_parts['edge']:.3f}|F:{avg_parts['fft']:.3f}|"
             f"S:{avg_parts['ssim']:.3f}|N:{avg_parts['nll']:.3f}] | Val PSNR: {val_psnr:.2f}dB "
             f"(EMA: {val_psnr_ema:.2f}dB, Bicubic: {val_bicubic_psnr:.2f}dB, "
             f"{eff_ema:.1f}% estimated gain) | Val SSIM: {val_ssim:.4f} "
