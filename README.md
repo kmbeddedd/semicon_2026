@@ -34,20 +34,6 @@ The full MambaIRv2 Base implementation is also included for continued research: 
 
 The accepted checkpoint and restored test outputs are the verified NAFNet research model. The full MambaIRv2 Base fusion path is clearly isolated as an unverified experiment and is not substituted for the final model unless it beats the accepted validation PSNR.
 
-## 60-second judge overview
-
-| Question | Answer |
-|---|---|
-| **What is the problem?** | Joint denoising and 2× super-resolution of low-dose semiconductor inspection images. |
-| **What is the input/output?** | One grayscale `128×128` degraded image → one restored `256×256` image in physical `[0,1]` intensity range. |
-| **What was built?** | A 10.23M-parameter Research NAFNet-SR, complete training/evaluation pipeline, Google Colab workflows, and a verified checkpoint. |
-| **What is novel here?** | Identity-safe transfer from a proven residual model into a gated **2D local/FFT bottleneck mixer**, plus a beta-NLL uncertainty head used as auxiliary supervision. |
-| **Best verified result** | **28.83964 dB PSNR** with 8-fold TTA across all 320 validation pairs. |
-| **Improvement over the prior model** | **+0.03406 dB PSNR with TTA**, improving 286/320 paired validation images. |
-| **Speed** | 14.05 ms/image without TTA (71.2 images/s) or 145.55 ms/image with maximum-accuracy TTA on an RTX 2050. |
-| **Reproducibility** | Seeded training, self-describing checkpoints, strict state loading, atomic saves, 19 automated tests, and full-dataset evaluation. |
-| **Next experiment** | Official full MambaIRv2 Base global branch + NAFNet local branch, spatial uncertainty-guided fusion, ADD+, then pure-MSE polish. This is implemented but not yet claimed as an improvement. |
-
 ## Why this solution stands out
 
 1. **Metrology-safe residual prediction** — the network predicts only the correction to bicubic upsampling, preserving the low-frequency physical structure instead of recreating the entire image.
